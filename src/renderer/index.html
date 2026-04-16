@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CodePeek</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="island" id="island">
+    <div class="island-body peek-idle" id="islandBody">
+    <!-- Header capsule -->
+    <div class="header" id="header">
+      <div class="mascot" id="mascot"></div>
+      <div class="status-dot" id="statusDot"></div>
+      <span class="title" id="titleText">CodePeek</span>
+      <span class="header-stats" id="headerStats"></span>
+      <div class="header-actions">
+        <button class="btn-icon btn-settings" id="btnSettings" title="Settings">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="3"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
+          </svg>
+        </button>
+        <button class="btn-icon btn-collapse" id="btnCollapse" style="display:none" title="Collapse">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3">
+            <polyline points="18 15 12 9 6 15"/>
+          </svg>
+        </button>
+      </div>
+    </div>
+
+    <!-- Expanded content -->
+    <div class="content" id="content">
+      <div class="section" id="sessionsSection">
+        <div class="session-toolbar">
+          <span class="section-title" id="sessionsTitle">Sessions</span>
+          <div class="group-buttons" id="groupButtons">
+            <button class="group-btn active" data-group="all">ALL</button>
+            <button class="group-btn" data-group="status">STA</button>
+            <button class="group-btn" data-group="cli">CLI</button>
+          </div>
+        </div>
+        <div id="sessionsList"></div>
+      </div>
+
+      <div class="section" id="permissionsSection" style="display:none">
+        <div class="section-title warning-text" id="permissionsTitle">Permission Required</div>
+        <div id="permissionsList"></div>
+      </div>
+
+      <div class="section" id="questionsSection" style="display:none">
+        <div class="section-title" id="questionsTitle">Questions</div>
+        <div id="questionsList"></div>
+      </div>
+
+      <!-- Surface: completion (event-driven single card, auto-dismisses after 5s). -->
+      <div class="section" id="completionSection" style="display:none">
+        <div class="section-title" id="completionTitle">Completed</div>
+        <div id="completionBody"></div>
+      </div>
+    </div>
+    </div><!-- /.island-body -->
+  </div>
+
+  <!-- Settings modal -->
+  <div class="modal-overlay" id="settingsModal" style="display:none">
+    <div class="modal">
+      <div class="modal-header">
+        <span id="settingsTitle">Settings</span>
+        <button class="btn-icon" id="btnSettingsClose">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div class="tabs">
+          <button class="tab active" data-tab="general" id="tabGeneral">General</button>
+          <button class="tab" data-tab="behavior" id="tabBehavior">Behavior</button>
+          <button class="tab" data-tab="appearance" id="tabAppearance">Appearance</button>
+          <button class="tab" data-tab="mascots" id="tabMascots">Mascots</button>
+          <button class="tab" data-tab="sound" id="tabSound">Sound</button>
+          <button class="tab" data-tab="hooks" id="tabHooks">Hooks</button>
+          <button class="tab" data-tab="about" id="tabAbout">About</button>
+        </div>
+
+        <div class="tab-content active" data-panel="general">
+          <div class="form-row">
+            <label id="lblLang">Language</label>
+            <select id="selLang">
+              <option value="auto">Auto (System)</option>
+              <option value="en">English</option>
+              <option value="zh">中文</option>
+            </select>
+          </div>
+          <div class="form-row">
+            <label id="lblStartOnLogin">Start on Login</label>
+            <label class="switch"><input type="checkbox" id="chkStartOnLogin"><span class="slider"></span></label>
+          </div>
+          <div class="form-row">
+            <label id="lblDisplay">Display</label>
+            <select id="selDisplay"></select>
+          </div>
+        </div>
+
+        <div class="tab-content" data-panel="behavior">
+          <div class="form-row">
+            <label id="lblAutoHide">Auto Hide Panel</label>
+            <label class="switch"><input type="checkbox" id="chkAutoHide"><span class="slider"></span></label>
+          </div>
+          <div class="form-row">
+            <label id="lblHoverExpand">Hover to Expand</label>
+            <label class="switch"><input type="checkbox" id="chkHoverExpand"><span class="slider"></span></label>
+          </div>
+          <div class="form-row">
+            <label id="lblHoverExpandDelay">Hover Expand Delay</label>
+            <div class="inline">
+              <input type="range" id="rangeHoverExpandDelay" min="0" max="1000" step="20">
+              <span id="valHoverExpandDelay">80ms</span>
+            </div>
+          </div>
+          <div class="form-row">
+            <label id="lblHoverCollapseDelay">Auto Collapse Delay</label>
+            <div class="inline">
+              <input type="range" id="rangeHoverCollapseDelay" min="0" max="10000" step="100">
+              <span id="valHoverCollapseDelay">1500ms</span>
+            </div>
+          </div>
+          <div class="form-row">
+            <label id="lblCompletionTime">Completion Card Display Time</label>
+            <div class="inline">
+              <input type="range" id="rangeCompletionTime" min="1" max="30" step="1">
+              <span id="valCompletionTime">5s</span>
+            </div>
+          </div>
+          <div class="form-row">
+            <label id="lblSuppressNotif">Smart Notification Suppression</label>
+            <label class="switch"><input type="checkbox" id="chkSuppressNotif"><span class="slider"></span></label>
+          </div>
+          <div class="form-row">
+            <label id="lblCleanup">Clean Stale Sessions After</label>
+            <div class="inline">
+              <input type="number" id="numCleanup" min="0" max="86400" step="60" style="width:80px">
+              <span id="lblSeconds">seconds</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="tab-content" data-panel="appearance">
+          <div class="form-row">
+            <label id="lblPanelWidth">Panel Width</label>
+            <div class="inline">
+              <input type="range" id="rangePanelWidth" min="360" max="600" step="10">
+              <span id="valPanelWidth">420px</span>
+            </div>
+          </div>
+          <div class="form-row">
+            <label id="lblPanelHeight">Panel Height</label>
+            <div class="inline">
+              <input type="range" id="rangePanelHeight" min="300" max="800" step="20">
+              <span id="valPanelHeight">560px</span>
+            </div>
+          </div>
+          <div class="form-row">
+            <label id="lblFontSize">Font Size</label>
+            <div class="inline">
+              <input type="range" id="rangeFontSize" min="10" max="18" step="1">
+              <span id="valFontSize">13px</span>
+            </div>
+          </div>
+          <div class="form-row">
+            <label id="lblRespLines">Response Preview Lines</label>
+            <input type="number" id="numRespLines" min="1" max="10" style="width:60px">
+          </div>
+          <div class="form-row">
+            <label id="lblMascots">Show Mascots</label>
+            <label class="switch"><input type="checkbox" id="chkMascots"><span class="slider"></span></label>
+          </div>
+          <div class="form-row">
+            <label id="lblPeekHeight">Peek Edge Height</label>
+            <div class="inline">
+              <input type="range" id="rangePeekHeight" min="0" max="30" step="1">
+              <span id="valPeekHeight">6px</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="tab-content" data-panel="mascots">
+          <div class="mascot-gallery" id="mascotGallery"></div>
+        </div>
+
+        <div class="tab-content" data-panel="sound">
+          <div class="form-row">
+            <label id="lblSoundEnabled">Enable Sounds</label>
+            <label class="switch"><input type="checkbox" id="chkSoundEnabled"><span class="slider"></span></label>
+          </div>
+          <div class="form-row">
+            <label id="lblSoundPack">Sound Pack</label>
+            <select id="selSoundPack"></select>
+          </div>
+          <div class="form-row">
+            <label id="lblVolume">Volume</label>
+            <div class="inline">
+              <input type="range" id="rangeVolume" min="0" max="100" step="5">
+              <span id="valVolume">50%</span>
+            </div>
+          </div>
+          <div class="form-row-section" id="lblEventSounds">Event Sounds</div>
+          <div class="form-row">
+            <label id="lblSndSessionStart">Session Start</label>
+            <div class="inline">
+              <button class="btn-play" data-sound="sessionStart">▶</button>
+              <label class="switch"><input type="checkbox" id="chkSndSessionStart"><span class="slider"></span></label>
+            </div>
+          </div>
+          <div class="form-row">
+            <label id="lblSndToolUse">Tool Use</label>
+            <div class="inline">
+              <button class="btn-play" data-sound="toolUse">▶</button>
+              <label class="switch"><input type="checkbox" id="chkSndToolUse"><span class="slider"></span></label>
+            </div>
+          </div>
+          <div class="form-row">
+            <label id="lblSndPermission">Permission Request</label>
+            <div class="inline">
+              <button class="btn-play" data-sound="permission">▶</button>
+              <label class="switch"><input type="checkbox" id="chkSndPermission"><span class="slider"></span></label>
+            </div>
+          </div>
+          <div class="form-row">
+            <label id="lblSndQuestion">Question</label>
+            <div class="inline">
+              <button class="btn-play" data-sound="question">▶</button>
+              <label class="switch"><input type="checkbox" id="chkSndQuestion"><span class="slider"></span></label>
+            </div>
+          </div>
+          <div class="form-row">
+            <label id="lblSndComplete">Session Complete</label>
+            <div class="inline">
+              <button class="btn-play" data-sound="complete">▶</button>
+              <label class="switch"><input type="checkbox" id="chkSndComplete"><span class="slider"></span></label>
+            </div>
+          </div>
+        </div>
+
+        <div class="tab-content" data-panel="hooks">
+          <div class="form-row">
+            <label id="lblHookAll">One-click setup</label>
+            <button class="btn-small btn-primary" id="btnInstallAll">Install all supported</button>
+          </div>
+          <div class="form-row-section" id="lblHookStatusSection">Per-Agent Status</div>
+          <div class="form-row">
+            <label>Claude Code</label>
+            <div class="inline">
+              <span id="hookStatusText">Loading...</span>
+              <button class="btn-small" id="btnToggleHooks">Install</button>
+            </div>
+          </div>
+          <div class="form-row">
+            <label>Codex</label>
+            <div class="inline">
+              <span id="codexHookStatusText">Loading...</span>
+              <button class="btn-small" id="btnToggleCodexHooks">Install</button>
+            </div>
+          </div>
+          <div class="form-row-section" id="lblEnabledAgents">Enabled Agents</div>
+          <div id="agentList"></div>
+        </div>
+
+        <div class="tab-content" data-panel="about">
+          <div class="about-box">
+            <div class="about-logo">CP</div>
+            <div class="about-name">CodePeek</div>
+            <div class="about-version" id="aboutVersion">Version 0.1.0</div>
+            <div class="about-license" id="aboutLicense">MIT License</div>
+            <div class="about-links">
+              <a href="https://github.com/codepeek-labs/codepeek" id="aboutGitHub">View on GitHub</a>
+              <span class="about-credit"> · Inspired by <a href="https://github.com/wxtsky/CodeIsland">CodeIsland (macOS)</a></span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <audio id="audio" preload="auto"></audio>
+  <script src="renderer.js"></script>
+</body>
+</html>

@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+out/
+# build/ 内容默认忽略，但保留打包资源（图标等）入库
+build/*
+!build/icon.png
+!build/icon.ico
+!build/icon.icns
+
+# Logs
+*.log
+npm-debug.log*
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local launcher (per-machine paths, not for distribution)
+start.vbs
+start.cmd
+*.lnk
+
+# Local user data (not for repo)
+.codepeek/
+*.local.json

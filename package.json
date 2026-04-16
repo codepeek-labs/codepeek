@@ -1,0 +1,63 @@
+{
+  "name": "codepeek",
+  "version": "0.1.0",
+  "description": "Dynamic Island for Claude Code, Codex & AI coding agents on Windows",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/codepeek-labs/codepeek.git"
+  },
+  "homepage": "https://github.com/codepeek-labs/codepeek",
+  "license": "MIT",
+  "author": "Evan",
+  "main": "src/main/index.js",
+  "scripts": {
+    "start": "node scripts/start.js",
+    "install-hooks": "node src/main/hookInstaller.js install",
+    "uninstall-hooks": "node src/main/hookInstaller.js uninstall",
+    "build": "electron-builder",
+    "build:portable": "electron-builder --win portable",
+    "build:installer": "electron-builder --win nsis"
+  },
+  "devDependencies": {
+    "electron": "^33.0.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.codepeek-labs.codepeek",
+    "productName": "CodePeek",
+    "copyright": "Copyright (c) 2026 Evan",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "src/**/*",
+      "scripts/start.js",
+      "package.json",
+      "LICENSE",
+      "README.md",
+      "build/icon.png"
+    ],
+    "win": {
+      "target": [
+        { "target": "nsis", "arch": ["x64"] },
+        { "target": "portable", "arch": ["x64"] }
+      ],
+      "icon": "build/icon.png",
+      "artifactName": "CodePeek-${version}-${arch}-${os}.${ext}",
+      "sign": null
+    },
+    "forceCodeSigning": false,
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "CodePeek"
+    },
+    "portable": {
+      "artifactName": "CodePeek-${version}-portable.${ext}"
+    }
+  }
+}
