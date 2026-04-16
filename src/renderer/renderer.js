@@ -202,6 +202,7 @@ function handleCompletion(data) {
 
 function showCompletionSurface(data) {
   _completionCurrent = data;
+  _completionHover = false; // reset stale hover flag from previous card
   _lastCompletionShownAt = Date.now();
   renderCompletionBody(data);
   reconcileSurface();
@@ -257,17 +258,20 @@ function renderCompletionBody(data) {
 
 function startCompletionTimer() {
   if (_completionTimer) clearTimeout(_completionTimer);
-  if (_completionHover) return;
   const ms = ((currentConfig.completionDisplayTime || 5) * 1000);
-  _completionTimer = setTimeout(dismissCompletion, ms);
+  _completionTimer = setTimeout(() => {
+    // If hovering when timer fires, wait for mouseleave instead of dismissing.
+    if (_completionHover) { _completionTimer = null; return; }
+    dismissCompletion();
+  }, ms);
 }
 
 function dismissCompletion() {
   if (_completionTimer) { clearTimeout(_completionTimer); _completionTimer = null; }
   _completionCurrent = null;
   completionBody.innerHTML = '';
-  // If the island was expanded for this completion and the user hasn't pinned it, collapse.
-  if (isExpanded && !manuallyPinned && !_mouseOverIsland) {
+  // Always collapse after completion dismisses (unless user pinned).
+  if (isExpanded && !manuallyPinned) {
     collapse();
   } else {
     reconcileSurface();
@@ -388,6 +392,8 @@ function collapse() {
       completionBody.innerHTML = '';
     }
     _completionBadgeCount = 0;
+    _lastSessionStructure = '';
+    _lastSessionContent = '';
     render();
   }, 480);
 }
@@ -517,7 +523,30 @@ function _doRender() {
   if (showQuestion) renderQuestions(pendingQuestions.slice(0, 1));
 }
 
+let _lastSessionStructure = ''; // triggers full rebuild (IDs + agents)
+let _lastSessionContent = '';   // triggers in-place update only
 function renderSessions(sessions) {
+  // Structure fingerprint: session IDs and agent types (adding/removing cards)
+  const groupMode = currentConfig.sessionGrouping || 'all';
+  const structFp = groupMode + ':' + sessions.map(s => `${s.id}:${s.agent || ''}:${s.isRunning}:${agentStatusToMascotState(s.status || 'idle')}`).join('|');
+  // Content fingerprint: status, tool, error, prompt, response
+  const contentFp = sessions.map(s => `${s.status}:${s.currentTool || ''}:${s.lastError || ''}:${s.lastPrompt || ''}:${s.lastResponse || ''}`).join('|');
+
+  // If only content changed (not structure), patch existing cards in place.
+  if (structFp === _lastSessionStructure && contentFp !== _lastSessionContent) {
+    _lastSessionContent = contentFp;
+    _patchSessionCards(sessions);
+    return;
+  }
+  if (structFp === _lastSessionStructure && contentFp === _lastSessionContent) return;
+
+  _lastSessionStructure = structFp;
+  _lastSessionContent = contentFp;
+
+  // Full rebuild: destroy old canvases
+  sessionsList.querySelectorAll('.session-agent-badge').forEach(b => {
+    if (b._mascotCanvas) destroyMascotCanvas(b._mascotCanvas);
+  });
   sessionsList.innerHTML = '';
 
   if (sessions.length === 0) {
@@ -563,6 +592,39 @@ function renderSessions(sessions) {
   }
 }
 
+function _patchSessionCards(sessions) {
+  const cards = sessionsList.querySelectorAll('.session-card');
+  const sessionMap = new Map(sessions.map(s => [s.id, s]));
+  cards.forEach(card => {
+    const sid = card.dataset.sessionId;
+    const s = sessionMap.get(sid);
+    if (!s) return;
+    // Patch status dot + label
+    const dot = card.querySelector('.session-status-dot');
+    const lbl = card.querySelector('.session-status-label');
+    const statusClass = s.isRunning === false ? 'stale' : (s.status || 'active');
+    if (dot) { dot.className = 'session-status-dot ' + statusClass; }
+    if (lbl) { lbl.className = 'session-status-label ' + statusClass; lbl.textContent = s.isRunning === false ? currentDict.statusStale : getStatusLabel(s.status || 'active'); }
+    // Patch tool bar
+    let toolBar = card.querySelector('.session-tool-bar');
+    const toolInfo = getLingeringTool(s);
+    if (toolInfo) {
+      if (!toolBar) { toolBar = document.createElement('div'); const meta = card.querySelector('.session-meta'); if (meta) meta.after(toolBar); else card.appendChild(toolBar); }
+      toolBar.className = 'session-tool-bar tool-color-' + getToolColorClass(toolInfo.tool);
+      if (toolInfo.lingering) toolBar.classList.add('tool-lingering');
+      toolBar.textContent = toolInfo.input ? `${toolInfo.tool}: ${String(toolInfo.input).substring(0, 80)}` : String(toolInfo.tool);
+    } else if (toolBar) {
+      toolBar.remove();
+    }
+    // Patch error
+    let errEl = card.querySelector('.session-error');
+    if (s.lastError) {
+      if (!errEl) { errEl = document.createElement('div'); errEl.className = 'session-error'; card.appendChild(errEl); }
+      errEl.textContent = '⚠ ' + String(s.lastError).substring(0, 100);
+    } else if (errEl) { errEl.remove(); }
+  });
+}
+
 function buildSessionCard(s) {
   const name = s.name || s.projectName || shortId(s.id);
   const statusClass = s.isRunning === false ? 'stale' : (s.status || 'active');
@@ -592,12 +654,10 @@ function buildSessionCard(s) {
 
   const badge = document.createElement('span');
   badge.className = 'session-agent-badge';
-  badge.style.background = sanitizeColor(agent.color);
-  // Prefer inline SVG (main-process constant, XSS-safe); fall back to the first letter.
-  badge.innerHTML = agent.iconSvg
-    ? `<svg viewBox="0 0 24 24" width="22" height="22" style="color:#fff">${agent.iconSvg}</svg>`
-    : '';
-  if (!agent.iconSvg) badge.textContent = String(agent.icon || '?');
+  badge.style.background = 'transparent';
+  const mascotCanvas = createMascotCanvas(agentId, s.status || 'idle', 32);
+  badge.appendChild(mascotCanvas);
+  badge._mascotCanvas = mascotCanvas;
 
   const nameEl = document.createElement('span');
   nameEl.className = 'session-name';

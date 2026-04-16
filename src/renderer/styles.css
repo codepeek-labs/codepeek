@@ -266,16 +266,21 @@ html, body {
 .session-top { display: flex; align-items: center; margin-bottom: 6px; gap: 8px; }
 
 .session-agent-badge {
-  width: 26px; height: 26px;
-  border-radius: 8px;
+  width: 32px; height: 32px;
+  border-radius: 0;
   font-size: 10px; font-weight: 700;
   display: flex; align-items: center; justify-content: center;
   color: white;
   flex-shrink: 0;
-  overflow: hidden;
-  box-shadow: inset 0 -3px 6px rgba(0,0,0,0.12), inset 0 2px 4px rgba(255,255,255,0.18);
+  overflow: visible;
+  box-shadow: none;
+  background: transparent !important;
 }
 .session-agent-badge svg { display: block; }
+.session-agent-badge canvas {
+  display: block;
+  border-radius: 6px;
+}
 
 /* ===== Mascot animations ===== */
 /* Subtle float (breathing) on active session cards. */
