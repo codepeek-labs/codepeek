@@ -1209,17 +1209,24 @@ function renderAgentList() {
 
 function renderMascotGallery() {
   const gallery = document.getElementById('mascotGallery');
+  // Destroy old mascot canvases
+  gallery.querySelectorAll('.mascot-visual').forEach(v => {
+    const c = v.querySelector('canvas');
+    if (c) destroyMascotCanvas(c);
+  });
   gallery.innerHTML = '';
+  const states = ['idle', 'thinking', 'waiting_permission'];
   for (const a of currentAgents) {
     const item = document.createElement('div');
     item.className = 'mascot-item';
     if (!a.supported) item.style.opacity = '0.4';
     const vis = document.createElement('div');
     vis.className = 'mascot-visual';
-    const color = sanitizeColor(a.color);
-    vis.style.background = `linear-gradient(135deg, ${color}, #FF9F0A)`;
-    if (a.iconSvg) {
-      vis.innerHTML = `<svg viewBox="0 0 24 24" width="40" height="40" style="color:#fff">${a.iconSvg}</svg>`;
+    vis.style.background = 'transparent';
+    // Show all 3 animation states side by side
+    for (const st of states) {
+      const canvas = createMascotCanvas(a.id, st, 40);
+      vis.appendChild(canvas);
     }
     const nm = document.createElement('div');
     nm.className = 'mascot-name';
