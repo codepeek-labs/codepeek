@@ -207,6 +207,8 @@ function showCompletionSurface(data) {
   renderCompletionBody(data);
   reconcileSurface();
   startCompletionTimer();
+  // Play sound only when the card is actually displayed (not suppressed/throttled).
+  playSound('complete');
 }
 
 function renderCompletionBody(data) {
@@ -300,7 +302,7 @@ function applyConfigToUI() {
   else mascot.classList.remove('visible');
   const offsetX = currentConfig.panelOffsetX || 0;
   if (offsetX && isExpanded) {
-    island.style.transform = `translateY(0) translateX(${offsetX}px)`;
+    island.style.transform = `translateY(-2px) translateX(${offsetX}px)`;
   }
 }
 
@@ -350,7 +352,7 @@ function expand() {
   isExpanded = true;
   island.classList.add('expanded-state'); // slide fully into view
   const offsetX = currentConfig.panelOffsetX || 0;
-  if (offsetX) island.style.transform = `translateY(0) translateX(${offsetX}px)`;
+  if (offsetX) island.style.transform = `translateY(-2px) translateX(${offsetX}px)`;
   content.classList.add('expanded');      // reveal content body
   btnCollapse.style.display = 'flex';
   window.codePeek.refreshSessions();
@@ -362,9 +364,10 @@ let _collapseTimer = null;
 function collapse() {
   clearTimeout(hoverExpandTimer);
   clearTimeout(hoverCollapseTimer);
-  if (_collapseTimer) clearTimeout(_collapseTimer);
   hoverExpandTimer = null;
   hoverCollapseTimer = null;
+  // If a collapse animation is already in progress, let it finish — don't cancel the cleanup timer.
+  if (_collapseTimer) return;
   if (!isExpanded) return;
   isExpanded = false;
   manuallyPinned = false;
@@ -422,7 +425,7 @@ function onDragMove(e) {
   if (!_dragState) return;
   const dx = e.screenX - _dragState.startX;
   const newOffset = _dragState.startOffsetX + dx;
-  island.style.transform = `translateY(0) translateX(${newOffset}px)`;
+  island.style.transform = `translateY(-2px) translateX(${newOffset}px)`;
 }
 
 function onDragEnd(e) {
@@ -616,6 +619,9 @@ function _patchSessionCards(sessions) {
     } else if (toolBar) {
       toolBar.remove();
     }
+    // Patch time
+    const timeEl = card.querySelector('.session-time');
+    if (timeEl) timeEl.textContent = formatTimeAgo(s.lastActivity || s.lastActivityAt || s.startedAt);
     // Patch error
     let errEl = card.querySelector('.session-error');
     if (s.lastError) {
@@ -629,7 +635,7 @@ function buildSessionCard(s) {
   const name = s.name || s.projectName || shortId(s.id);
   const statusClass = s.isRunning === false ? 'stale' : (s.status || 'active');
   const statusLabel = s.isRunning === false ? currentDict.statusStale : getStatusLabel(s.status || 'active');
-  const timeAgo = s.timeAgo || '';
+  const timeAgo = formatTimeAgo(s.lastActivity || s.lastActivityAt || s.startedAt);
   const model = formatModel(s.model);
   const agentId = s.agent || 'claude';
   const agent = currentAgents.find(a => a.id === agentId) || { color: '#D97757', icon: 'C' };
@@ -767,12 +773,19 @@ function sanitizeColor(color) {
   return '#8E8E93';
 }
 
+let _lastRenderedPermissionId = null;
 function renderPermissions(permissions) {
   permissionsList.innerHTML = '';
-  if (permissions.length === 0) { permissionsSection.style.display = 'none'; return; }
+  if (permissions.length === 0) { permissionsSection.style.display = 'none'; _lastRenderedPermissionId = null; return; }
   permissionsSection.style.display = 'block';
   for (const p of permissions) {
     permissionsList.appendChild(buildPermissionCard(p));
+  }
+  // Play sound only when a new permission card appears (not on every re-render).
+  const headId = permissions[0]?.id;
+  if (headId && headId !== _lastRenderedPermissionId) {
+    _lastRenderedPermissionId = headId;
+    playSound('permission');
   }
 }
 
@@ -824,12 +837,19 @@ function buildPermissionCard(p) {
   return card;
 }
 
+let _lastRenderedQuestionId = null;
 function renderQuestions(questions) {
   questionsList.innerHTML = '';
-  if (questions.length === 0) { questionsSection.style.display = 'none'; return; }
+  if (questions.length === 0) { questionsSection.style.display = 'none'; _lastRenderedQuestionId = null; return; }
   questionsSection.style.display = 'block';
   for (const q of questions) {
     questionsList.appendChild(buildQuestionCard(q));
+  }
+  // Play sound only when a new question card appears (not on every re-render).
+  const headId = questions[0]?.id;
+  if (headId && headId !== _lastRenderedQuestionId) {
+    _lastRenderedQuestionId = headId;
+    playSound('question');
   }
 }
 
@@ -917,8 +937,22 @@ async function handleSessionClick(card, event) {
   }
 
   // Active session: focus the existing terminal tab.
-  const pid = parseInt(card.dataset.pid || '0');
+  let pid = parseInt(card.dataset.pid || '0');
   const sessionName = card.dataset.sessionName || '';
+
+  // Codex/other sessions spawned by Claude (via plugin) lack a PID.
+  // Fall back to the parent Claude session with the same cwd.
+  const agent = card.dataset.agent || 'claude';
+  if (!pid && cwd) {
+    // Prefer a session from a different agent type (e.g. Codex click → find Claude parent).
+    const parent = (currentState.sessions || []).find(s =>
+      s.pid && s.isRunning !== false && s.cwd === cwd && s.agent !== agent
+    ) || (currentState.sessions || []).find(s =>
+      s.pid && s.isRunning !== false && s.cwd === cwd
+    );
+    if (parent) pid = parent.pid;
+  }
+
   if (!pid) { showToast(currentDict.menuNoPid, 'error'); return; }
   showToast(currentDict.menuJumping, 'success');
   const result = await window.codePeek.jumpToTerminal(pid, sessionName, cwd);
@@ -931,6 +965,9 @@ async function handleSessionClick(card, event) {
 // ========== Sound playback ==========
 
 function playSound(type) {
+  if (!currentConfig.soundEnabled) return;
+  const keyMap = { sessionStart: 'soundOnSessionStart', toolUse: 'soundOnToolUse', permission: 'soundOnPermission', question: 'soundOnQuestion', complete: 'soundOnComplete' };
+  if (keyMap[type] && !currentConfig[keyMap[type]]) return;
   const url = currentSounds[type];
   if (!url) return;
   const vol = currentConfig.soundVolume || 0.5;
@@ -995,19 +1032,27 @@ island.addEventListener('mousemove', () => {
   if (!mouseInIsland) updateMouseInIsland(true);
 });
 
-// Safety poll every 250ms: verify the mouse is still inside the island rect.
-// Works around lost mouseleave events caused by Electron setIgnoreMouseEvents toggles.
-setInterval(() => {
-  if (!mouseInIsland) return; // already outside; nothing to verify
-  const rect = island.getBoundingClientRect();
-  // lastMouseEvent holds the most recent mousemove coordinates
-  const x = lastMouseX, y = lastMouseY;
-  if (x < 0 || y < 0) return;
-  const inside = x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
-  if (!inside && mouseInIsland) {
-    updateMouseInIsland(false);
+// Safety poll every 200ms: only active when the island is EXPANDED.
+// Uses screen.getCursorScreenPoint() from the main process — this works regardless
+// of setIgnoreMouseEvents state (unlike renderer mousemove which can stop updating).
+let _safetyPollInFlight = false;
+setInterval(async () => {
+  if (!mouseInIsland || !isExpanded || _safetyPollInFlight) return;
+  _safetyPollInFlight = true;
+  try {
+    const { screenX, screenY, winBounds } = await window.codePeek.getCursorScreenPoint();
+    if (!mouseInIsland || !isExpanded || !winBounds) return; // state may have changed during IPC
+    // Convert screen coordinates to window-relative coordinates.
+    const clientX = screenX - winBounds.x;
+    const clientY = screenY - winBounds.y;
+    const rect = island.getBoundingClientRect();
+    if (clientX < rect.left || clientX > rect.right || clientY < rect.top || clientY > rect.bottom) {
+      updateMouseInIsland(false);
+    }
+  } catch {} finally {
+    _safetyPollInFlight = false;
   }
-}, 250);
+}, 200);
 
 let lastMouseX = -1, lastMouseY = -1;
 window.addEventListener('mousemove', (e) => {
@@ -1434,6 +1479,17 @@ function getStatusLabel(status) {
     subagent: currentDict.statusSubagent,
     compacting: currentDict.statusCompacting
   }[status] || status;
+}
+
+function formatTimeAgo(ts) {
+  if (!ts) return '';
+  const diff = Date.now() - ts;
+  const min = Math.floor(diff / 60000);
+  if (min < 1) return '<1m';
+  if (min < 60) return min + 'm';
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return hr + 'h';
+  return Math.floor(hr / 24) + 'd';
 }
 
 function formatModel(model) {

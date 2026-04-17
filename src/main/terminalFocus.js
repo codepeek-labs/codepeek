@@ -54,9 +54,11 @@ try {
 $cmdLine = if ($procCmdLines.ContainsKey($NodePid)) { $procCmdLines[$NodePid] } else { "" }
 $nameCheck = if ($procNames.ContainsKey($NodePid)) { $procNames[$NodePid] } else { "" }
 $isNodeProc = $nameCheck -match '^(node|node\\.exe)$'
+$isCodexProc = $nameCheck -match '^(codex|codex\\.exe)$'
 $isClaudeCmd = $cmdLine -match '(claude-code|cli\\.js)' -or $cmdLine -match 'claude'
-if (-not $isNodeProc -or -not $isClaudeCmd) {
-  Write-Host "PID_NOT_CLAUDE:pid=$NodePid,name=$nameCheck"
+$isCodexCmd = $cmdLine -match 'codex'
+if (-not (($isNodeProc -and ($isClaudeCmd -or $isCodexCmd)) -or $isCodexProc)) {
+  Write-Host "PID_NOT_AGENT:pid=$NodePid,name=$nameCheck"
   exit 1
 }
 

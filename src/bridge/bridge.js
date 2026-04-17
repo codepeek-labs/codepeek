@@ -76,6 +76,7 @@ process.stdin.on('end', () => {
   event.bridge_platform = 'windows';
   event.bridge_timestamp = new Date().toISOString();
   event.bridge_pid = process.pid;
+  event.bridge_ppid = process.ppid; // PID of the CLI that spawned the bridge (Claude/Codex)
   event._source = SOURCE; // 'claude' | 'codex'
 
   // Only Claude's PermissionRequest and Notification are blocking.

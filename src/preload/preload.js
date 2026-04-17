@@ -37,6 +37,7 @@ contextBridge.exposeInMainWorld('codePeek', {
   jumpToTerminal: (pid, sessionName, cwd) => ipcRenderer.invoke('jump-to-terminal', pid, sessionName, cwd),
   launchSession: (sessionId, cwd, agent) => ipcRenderer.invoke('launch-session', sessionId, cwd, agent),
   refreshSessions: () => ipcRenderer.invoke('refresh-sessions'),
+  getCursorScreenPoint: () => ipcRenderer.invoke('get-cursor-screen-point'),
 
   // Autostart
   toggleAutoStart: (enabled) => ipcRenderer.invoke('toggle-autostart', enabled),

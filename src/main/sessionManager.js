@@ -40,11 +40,11 @@ class SessionManager extends EventEmitter {
         break;
       case 'UserPromptSubmit':
         this._onUserPrompt(sessionId, event);
-        this.emit('sound', 'sessionStart');
+        this.emit('sound', 'sessionStart', { sessionId, agent: this.sessions.get(sessionId)?.agent });
         break;
       case 'PreToolUse':
         this._onPreToolUse(sessionId, event);
-        this.emit('sound', 'toolUse');
+        this.emit('sound', 'toolUse', { sessionId, agent: this.sessions.get(sessionId)?.agent });
         break;
       case 'PostToolUse':
         this._onPostToolUse(sessionId, event, false);
@@ -63,7 +63,8 @@ class SessionManager extends EventEmitter {
         return;
       case 'Stop':
         this._onStop(sessionId, event);
-        this.emit('sound', 'complete');
+        // Sound is played by the renderer only when the completion card is actually shown,
+        // so we do NOT emit 'sound' here (it would desync with suppressed cards).
         break;
       case 'SubagentStart':
         this._onSubagentStart(sessionId, event);
@@ -158,6 +159,7 @@ class SessionManager extends EventEmitter {
     const hookSessionIds = new Set(hookSessions.map(s => s.id));
     const scanOnly = (this.scannedSessions || []).filter(s => !hookSessionIds.has(s.id));
 
+
     const mergedHook = hookSessions.map(hs => {
       const scanned = (this.scannedSessions || []).find(s => s.id === hs.id);
       if (scanned) {
@@ -174,19 +176,28 @@ class SessionManager extends EventEmitter {
           model: scanned.model || hs.model || '',
           lastPrompt: scanned.lastPrompt || hs.lastPrompt || '',
           lastResponse: scanned.lastResponse || hs.lastResponse || '',
-          timeAgo: scanned.timeAgo || '',
+          timeAgo: this._formatTimeAgo(Math.max(hs.lastActivity || 0, scanned.lastActivityAt || 0)),
           pid: scanned.pid || hs.pid,
           isRunning: scanned.isRunning !== undefined ? scanned.isRunning : true,
           projectName: scanned.projectName || ''
         };
       }
-      return hs;
+      return { ...hs, timeAgo: this._formatTimeAgo(hs.lastActivity) };
     });
 
-    const allSessions = [...mergedHook, ...scanOnly].sort((a, b) => {
+    // Recalculate timeAgo for scan-only sessions (scanner caches it at scan time, not query time).
+    const scanOnlyFresh = scanOnly.map(s => ({
+      ...s,
+      timeAgo: this._formatTimeAgo(s.lastActivityAt || s.startedAt)
+    }));
+
+    const allSessions = [...mergedHook, ...scanOnlyFresh].sort((a, b) => {
       if (a.isRunning === false && b.isRunning !== false) return 1;
       if (a.isRunning !== false && b.isRunning === false) return -1;
-      return (b.startedAt || 0) - (a.startedAt || 0);
+      // Sort by last activity (most recent first), fallback to startedAt.
+      const aTime = a.lastActivity || a.lastActivityAt || a.startedAt || 0;
+      const bTime = b.lastActivity || b.lastActivityAt || b.startedAt || 0;
+      return bTime - aTime;
     });
 
     return {
@@ -247,6 +258,8 @@ class SessionManager extends EventEmitter {
     }
     session.lastActivity = Date.now();
     if (event.cwd) session.cwd = event.cwd;
+    // bridge_ppid is the PID of the CLI process that spawned the bridge (Claude/Codex).
+    if (event.bridge_ppid && !session.pid) session.pid = event.bridge_ppid;
   }
 
   _onSessionStart(sessionId, event) {
@@ -337,7 +350,7 @@ class SessionManager extends EventEmitter {
     });
 
     this._updateSessionStatus(sessionId, 'waiting_permission');
-    this.emit('sound', 'permission');
+    // Sound is played by the renderer only when the permission card is actually rendered.
     this.emit('state-changed');
   }
 
@@ -357,7 +370,7 @@ class SessionManager extends EventEmitter {
       respond: respond || (() => {})
     });
     this._updateSessionStatus(sessionId, 'waiting_answer');
-    this.emit('sound', 'question');
+    // Sound is played by the renderer only when the question card is actually rendered.
     this.emit('state-changed');
   }
 
@@ -470,6 +483,17 @@ class SessionManager extends EventEmitter {
         }
       }
     } catch { return ''; }
+  }
+
+  _formatTimeAgo(ts) {
+    if (!ts) return '';
+    const diff = Date.now() - ts;
+    const min = Math.floor(diff / 60000);
+    if (min < 1) return '<1m';
+    if (min < 60) return min + 'm';
+    const hr = Math.floor(min / 60);
+    if (hr < 24) return hr + 'h';
+    return Math.floor(hr / 24) + 'd';
   }
 
   _cleanupStaleSessions() {

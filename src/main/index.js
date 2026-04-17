@@ -90,6 +90,9 @@ app.whenReady().then(async () => {
   // Forward completion events to the renderer.
   // When suppressNotifications=true we skip the UI card entirely.
   sessionManager.on('completion', (payload) => {
+    const logLine = `${new Date().toISOString()} [completion] session=${payload.sessionId} project=${payload.projectName} title=${payload.sessionTitle} agent=${payload.agent}\n`;
+    console.log(logLine.trim());
+    require('fs').appendFile(require('path').join(require('os').homedir(), '.codepeek', 'sound.log'), logLine, () => {});
     if (config.get('suppressNotifications') === true) return;
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('completion-notify', payload);
@@ -97,7 +100,7 @@ app.whenReady().then(async () => {
   });
 
   // Forward sound events to the renderer
-  sessionManager.on('sound', (type) => {
+  sessionManager.on('sound', (type, meta) => {
     if (!config.get('soundEnabled')) return;
     const keyMap = {
       sessionStart: 'soundOnSessionStart',
@@ -107,6 +110,9 @@ app.whenReady().then(async () => {
       complete: 'soundOnComplete'
     };
     if (!config.get(keyMap[type])) return;
+    const logLine = `${new Date().toISOString()} [sound] type=${type} session=${meta?.sessionId || '?'} agent=${meta?.agent || '?'}\n`;
+    console.log(logLine.trim());
+    require('fs').appendFile(require('path').join(require('os').homedir(), '.codepeek', 'sound.log'), logLine, () => {});
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('play-sound', type);
     }
@@ -449,6 +455,14 @@ function registerIPC() {
   });
 
   secureHandle('refresh-sessions', () => { if (sessionScanner) sessionScanner.refreshNow(); });
+
+  // Expose the real screen cursor position for the renderer's safety poll.
+  // This does NOT depend on renderer mouse events — works even when setIgnoreMouseEvents is active.
+  secureHandle('get-cursor-screen-point', () => {
+    const cursor = screen.getCursorScreenPoint();
+    const win = mainWindow && !mainWindow.isDestroyed() ? mainWindow.getBounds() : null;
+    return { screenX: cursor.x, screenY: cursor.y, winBounds: win };
+  });
 
   secureHandle('approve-permission', (_, requestId, behavior) => {
     if (typeof requestId !== 'string') return;

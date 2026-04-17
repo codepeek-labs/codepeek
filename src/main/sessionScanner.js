@@ -423,16 +423,19 @@ foreach ($p in $procs) {
     const projectName = this._getProjectName(session.cwd);
     const lastConversation = this._getLastConversation(session);
 
-    // Activity is determined purely by process liveness (is the terminal still open?).
-    // We deliberately do NOT fall back to jsonl silence, which would misclassify active-but-quiet sessions as stale.
     const alive = this._isSessionActive(session);
-    // Optimistically assume active while the process table hasn't loaded yet; this self-corrects within 1s.
     const isRunning = (alive === null) ? true : alive;
 
-    const jsonlMtime = lastConversation.mtime || 0;
+    // Use JSONL mtime for activity time. If the PID file's sessionId points to a stale
+    // JSONL (e.g. after claude --resume), look for a newer JSONL in the same project dir
+    // that was created AFTER this session started (to avoid picking up unrelated sessions).
+    let jsonlMtime = lastConversation.mtime || 0;
+    if (session.cwd && (Date.now() - jsonlMtime > 300000)) {
+      const newestMtime = this._getNewestProjectMtimeSince(session.cwd, session.startedAt || 0, session.sessionId);
+      if (newestMtime > jsonlMtime) jsonlMtime = newestMtime;
+    }
     const activityTs = jsonlMtime || session.startedAt || 0;
 
-    // Title priority: session.json name > custom-title (jsonl) > ai-title (jsonl) > project name.
     const name = session.name
       || lastConversation.customTitle
       || lastConversation.aiTitle
@@ -456,6 +459,38 @@ foreach ($p in $procs) {
       lastResponse: lastConversation.lastResponse || '',
       source: 'scanner'
     };
+  }
+
+  // Get the mtime of the most recently modified JSONL in the project dir,
+  // but only consider files whose mtime is AFTER `sinceMs` (the session's startedAt)
+  // and exclude the session's own JSONL (`excludeSessionId`).
+  // This catches resumed sessions (new sessionId, same PID) without picking up
+  // unrelated sessions that happen to share the same cwd.
+  _getNewestProjectMtimeSince(cwd, sinceMs, excludeSessionId) {
+    try {
+      const cwdNormalized = (cwd || '')
+        .replace(/^([A-Z]):/, '$1-')
+        .replace(/[/\\]/g, '-')
+        .replace(/^-+/, '').replace(/-+$/, '');
+      const projDir = path.join(PROJECTS_DIR, cwdNormalized);
+      if (!fs.existsSync(projDir)) return 0;
+      let newest = 0;
+      for (const f of fs.readdirSync(projDir)) {
+        if (!f.endsWith('.jsonl')) continue;
+        // Skip the session's own JSONL (we already have its mtime).
+        const fileSessionId = f.slice(0, -6);
+        if (fileSessionId === excludeSessionId) continue;
+        try {
+          const st = fs.statSync(path.join(projDir, f));
+          // Only consider files created/modified after this session started.
+          // Use birthtime (creation time) on Windows; fall back to mtime.
+          const createdAt = (st.birthtimeMs > 0 && st.birthtimeMs < st.mtimeMs) ? st.birthtimeMs : st.mtimeMs;
+          if (createdAt < sinceMs) continue;
+          if (st.mtimeMs > newest) newest = st.mtimeMs;
+        } catch {}
+      }
+      return newest;
+    } catch { return 0; }
   }
 
   _getProjectName(cwd) {

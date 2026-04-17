@@ -42,11 +42,15 @@ function getBridgeCommand(source) {
 }
 
 // Match our own hook entries precisely so unrelated hooks that happen to include "bridge.js" are left alone.
+// Also matches the legacy ".codeisland/bridge.js" path so upgrades clean up old entries.
 function isCodePeekHook(hh) {
   if (!hh || !hh.command) return false;
   const cmd = String(hh.command).toLowerCase();
   const ours = getBridgePath().toLowerCase();
-  return cmd.includes(ours) || cmd.includes(ours.replace(/\\/g, '/'));
+  if (cmd.includes(ours) || cmd.includes(ours.replace(/\\/g, '/'))) return true;
+  // Legacy path: ~/.codeisland/bridge.js
+  const legacy = path.join(os.homedir(), '.codeisland', 'bridge.js').toLowerCase();
+  return cmd.includes(legacy) || cmd.includes(legacy.replace(/\\/g, '/'));
 }
 
 // ========== Codex hook support ==========
