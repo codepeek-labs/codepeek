@@ -50,6 +50,7 @@ const DICT = {
     menuSwitched: 'Switched to terminal',
     menuJumpFailed: 'Jump failed',
     menuNoPid: 'No PID for this session',
+    sessionClosed: 'Terminal was closed — refreshing...',
 
     // Settings tabs
     tabGeneral: 'General',
@@ -168,6 +169,7 @@ const DICT = {
     menuSwitched: '已切换到终端',
     menuJumpFailed: '跳转失败',
     menuNoPid: '该会话没有 PID',
+    sessionClosed: '终端已关闭，正在刷新...',
 
     tabGeneral: '通用',
     tabBehavior: '行为',

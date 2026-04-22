@@ -75,6 +75,9 @@ async function init() {
 
   window.codePeek.onStateChanged(state => {
     currentState = state;
+    if ((state.pendingPermissions || []).length > 0 || (state.pendingQuestions || []).length > 0) {
+      console.log(`[perm] state-changed perms=${state.pendingPermissions.length} qs=${state.pendingQuestions.length} surface=${_surface}`);
+    }
     // A state-changed event may introduce/remove approval or question items; recompute surface.
     reconcileSurface();
     render();
@@ -147,16 +150,52 @@ function setSurface(next) {
     if (!isExpanded) {
       _autoExpandedByEvent = true; // flag that the expansion was event-driven, not user-driven
       expand();
+    } else if (EVENT_SURFACES.has(next)) {
+      // Already expanded, so expand() would early-return without cleaning leftover inline styles
+      // from a previous collapse phase 1 (opacity:0, pointer-events:none). If we skip this,
+      // the card renders into a transparent container and the user sees nothing.
+      if (_collapseTimer) { clearTimeout(_collapseTimer); _collapseTimer = null; }
+      content.style.opacity = '';
+      content.style.pointerEvents = '';
+      if (!content.classList.contains('expanded')) content.classList.add('expanded');
+      if (!island.classList.contains('expanded-state')) island.classList.add('expanded-state');
+    }
+    // Nuclear option: make event cards visible *instantly*, no animation. Claude's CLI has its own
+    // terminal TUI approval; users often answer there before our 0.32s expand animation finishes.
+    // When that happens, bridge closes, pendingPermissions clears, and the island collapses —
+    // the user heard the sound but never saw the card. Snapping avoids the race.
+    if (EVENT_SURFACES.has(next)) {
+      content.style.setProperty('opacity', '1', 'important');
+      content.style.setProperty('max-height', '540px', 'important');
+      content.style.setProperty('pointer-events', 'auto', 'important');
+      content.style.setProperty('transition', 'none', 'important');
+      // Force the island out to the fully-expanded transform immediately (no transition).
+      const offsetX = currentConfig.panelOffsetX || 0;
+      const xform = offsetX ? `translateY(-2px) translateX(${offsetX}px)` : 'translateY(-2px)';
+      island.style.setProperty('transform', xform, 'important');
+      island.style.setProperty('transition', 'none', 'important');
+      // Re-enable transitions on next frame so subsequent user-driven collapse/expand still animates.
+      requestAnimationFrame(() => {
+        content.style.removeProperty('transition');
+        island.style.removeProperty('transition');
+      });
     }
   }
-  render();
+  // Paint event surfaces synchronously — rAF gets throttled when the peek-small transparent
+  // window has no compositor activity, and the card would never paint.
+  if (EVENT_SURFACES.has(next)) renderNow();
+  else render();
 }
 
 // Recompute the target surface from the current state and completion-display flags.
 const EVENT_SURFACES = new Set(['approval', 'question', 'completion']);
 function reconcileSurface() {
-  const hasApproval = currentState.pendingPermissions.length > 0;
-  const hasQuestion = currentState.pendingQuestions.length > 0;
+  // Treat sticky-card states as "still has" so the surface stays on approval/question until the
+  // user dismisses by clicking a button. Claude often self-answers its own prompt in under 500ms
+  // via its terminal TUI, closing the bridge before the user can even register the island
+  // expanded — sticky keeps the info visible until the user actively sees and dismisses.
+  const hasApproval = currentState.pendingPermissions.length > 0 || !!_permStickyCard;
+  const hasQuestion = currentState.pendingQuestions.length > 0 || !!_questionStickyCard;
   if (hasApproval) { setSurface('approval'); return; }
   if (hasQuestion) { setSurface('question'); return; }
   if (_completionCurrent) { setSurface('completion'); return; }
@@ -164,7 +203,7 @@ function reconcileSurface() {
   if (!isExpanded) { setSurface('peek'); return; }
   // If the previous surface was an event card, the island was auto-expanded for it.
   // Collapse back unless the user has pinned or is hovering.
-  if (EVENT_SURFACES.has(_surface) && !manuallyPinned) {
+  if (EVENT_SURFACES.has(_surface) && !manuallyPinned && !_mouseOverIsland) {
     setSurface('peek');
     return;
   }
@@ -178,25 +217,29 @@ function reconcileSurface() {
 
 // Completion entry point: merges duplicates, throttles frequency, suppresses during input.
 function handleCompletion(data) {
-  if (!data) return;
+  if (!data) { console.log('[completion-debug] no data'); return; }
   const hasBlocking = currentState.pendingPermissions.length > 0 || currentState.pendingQuestions.length > 0;
   if (hasBlocking) {
+    console.log('[completion-debug] suppressed: blocking interaction');
     _completionBadgeCount++;
     updateCompletionBadge();
     return;
   }
   // Active typing and mouse not on the island: skip the card, bump the badge instead.
   if (!_mouseOverIsland && (Date.now() - _lastKeyAt) < INPUT_ACTIVE_MS) {
+    console.log('[completion-debug] suppressed: active typing');
     _completionBadgeCount++;
     updateCompletionBadge();
     return;
   }
   // Global throttle: at most one card within the throttle window.
   if (Date.now() - _lastCompletionShownAt < COMPLETION_THROTTLE_MS) {
+    console.log('[completion-debug] suppressed: throttled');
     _completionBadgeCount++;
     updateCompletionBadge();
     return;
   }
+  console.log('[completion-debug] showing card for', data.sessionTitle || data.projectName);
   showCompletionSurface(data);
 }
 
@@ -209,6 +252,7 @@ function showCompletionSurface(data) {
   startCompletionTimer();
   // Play sound only when the card is actually displayed (not suppressed/throttled).
   playSound('complete');
+  console.log(`[completion] show: surface=${_surface} expanded=${isExpanded} collapseTimer=${!!_collapseTimer}`);
 }
 
 function renderCompletionBody(data) {
@@ -232,18 +276,53 @@ function renderCompletionBody(data) {
   body.appendChild(t); body.appendChild(s);
   card.appendChild(icon); card.appendChild(body);
 
-  card.addEventListener('click', () => {
-    if (_completionCurrent && _completionCurrent.sessionId) {
-      const sess = (currentState.sessions || []).find(x => x.id === _completionCurrent.sessionId);
-      const pid = sess && sess.pid;
-      const name = (_completionCurrent.sessionTitle || _completionCurrent.projectName || '').toString();
-      const cwd = (_completionCurrent.cwd || (sess && sess.cwd) || '').toString();
-      if (pid) window.codePeek.jumpToTerminal(pid, name, cwd);
-    }
+  card.addEventListener('click', async () => {
+    // Snapshot the current completion payload before any await — it may be cleared by the
+    // auto-dismiss timer or another state change while we're awaiting getState.
+    const snapshot = _completionCurrent;
+    // Dismiss visual state immediately so the user sees feedback.
     if (_completionTimer) { clearTimeout(_completionTimer); _completionTimer = null; }
     _completionCurrent = null;
     completionBody.innerHTML = '';
     collapse();
+
+    if (!snapshot || !snapshot.sessionId) return;
+    const targetId = snapshot.sessionId;
+    const targetCwd = snapshot.cwd || '';
+    const targetAgent = snapshot.agent || '';
+    const name = (snapshot.sessionTitle || snapshot.projectName || '').toString();
+
+    // Re-fetch latest state (currentState might be stale by the time the user clicks).
+    let sessions = currentState.sessions || [];
+    try {
+      const state = await window.codePeek.getState();
+      sessions = state.sessions || [];
+    } catch {}
+
+    const sess = sessions.find(x => x.id === targetId);
+    let pid = sess && sess.pid;
+    const cwd = (targetCwd || (sess && sess.cwd) || '').toString();
+    // Fallback priority: (1) non-stale session with matching cwd and different agent (Codex → Claude parent);
+    // (2) any non-stale session with matching cwd.
+    if (!pid && cwd) {
+      const parent = sessions.find(s =>
+        s.pid && s.isRunning !== false && s.cwd === cwd && s.agent !== targetAgent
+      ) || sessions.find(s =>
+        s.pid && s.isRunning !== false && s.cwd === cwd
+      );
+      if (parent) pid = parent.pid;
+    }
+    console.log(`[jump-debug] click sid=${targetId} cwd=${cwd} pid=${pid} sessFound=${!!sess} sessIsRunning=${sess && sess.isRunning}`);
+    if (pid) {
+      try {
+        const r = await window.codePeek.jumpToTerminal(pid, name, cwd);
+        console.log(`[jump-debug] result ok=${r && r.success} err=${r && r.error} detail=${r && r.detail}`);
+      } catch (err) {
+        console.log(`[jump-debug] throw ${err && err.message}`);
+      }
+    } else {
+      showToast(currentDict.menuNoPid || 'No PID for this session', 'error');
+    }
   });
   card.addEventListener('mouseenter', () => {
     _completionHover = true;
@@ -269,11 +348,14 @@ function startCompletionTimer() {
 }
 
 function dismissCompletion() {
+  console.log(`[completion] dismiss: surface=${_surface} expanded=${isExpanded}`);
   if (_completionTimer) { clearTimeout(_completionTimer); _completionTimer = null; }
   _completionCurrent = null;
   completionBody.innerHTML = '';
-  // Always collapse after completion dismisses (unless user pinned).
-  if (isExpanded && !manuallyPinned) {
+  // If there are blocking interactions (approval/question), switch to that surface instead of collapsing.
+  if (hasBlockingInteraction()) {
+    reconcileSurface();
+  } else if (isExpanded && !manuallyPinned) {
     collapse();
   } else {
     reconcileSurface();
@@ -454,6 +536,8 @@ function scheduleCollapse() {
   clearTimeout(hoverExpandTimer);
   hoverExpandTimer = null;
   if (!isExpanded) return;
+  // Don't auto-collapse while a completion card is displayed — let its own timer handle dismissal.
+  if (_completionCurrent) return;
   // Intentionally no isUserInputting guard: a stuck focused input after closing Settings would block collapse forever.
   if (manuallyPinned || hasBlockingInteraction() || isModalOpen()) return;
   if (!currentConfig.autoHidePanel) return;
@@ -476,6 +560,14 @@ function render() {
     _renderScheduled = false;
     _doRender();
   });
+}
+
+// Event surfaces (approval/question/completion) must render synchronously — the window can be
+// peek-small and transparent, where rAF gets throttled by the compositor and the user ends up
+// staring at an empty shell while the card silently failed to paint.
+function renderNow() {
+  _renderScheduled = false;
+  _doRender();
 }
 
 function _doRender() {
@@ -516,6 +608,14 @@ function _doRender() {
   const showApproval  = _surface === 'approval';
   const showQuestion  = _surface === 'question';
   const showCompletion = _surface === 'completion';
+  // Keep event surfaces forcibly visible every render — something (possibly a collapse animation
+  // phase or residual inline style from a race) has been clobbering opacity to 0. Hard-set on
+  // every render so the card is never invisible while active.
+  if (showApproval || showQuestion || showCompletion) {
+    content.style.setProperty('opacity', '1', 'important');
+    content.style.setProperty('max-height', '540px', 'important');
+    content.style.setProperty('pointer-events', 'auto', 'important');
+  }
   sessionsSection.style.display    = showList ? 'block' : 'none';
   permissionsSection.style.display = showApproval ? 'block' : 'none';
   questionsSection.style.display   = showQuestion ? 'block' : 'none';
@@ -552,6 +652,12 @@ function renderSessions(sessions) {
   });
   sessionsList.innerHTML = '';
 
+  const mode = currentConfig.sessionGrouping || 'all';
+  // Update active button (always, even when the list is empty).
+  document.querySelectorAll('.group-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.group === mode);
+  });
+
   if (sessions.length === 0) {
     const empty = document.createElement('div');
     empty.className = 'empty-state';
@@ -559,12 +665,6 @@ function renderSessions(sessions) {
     sessionsList.appendChild(empty);
     return;
   }
-
-  const mode = currentConfig.sessionGrouping || 'all';
-  // Update active button
-  document.querySelectorAll('.group-btn').forEach(b => {
-    b.classList.toggle('active', b.dataset.group === mode);
-  });
 
   if (mode === 'all') {
     for (const s of sessions) sessionsList.appendChild(buildSessionCard(s));
@@ -774,13 +874,61 @@ function sanitizeColor(color) {
 }
 
 let _lastRenderedPermissionId = null;
+// Sticky card state. Permission/question cards stay visible after bridge closes (which happens
+// within ms when Claude self-answers via its TUI) until the user explicitly dismisses by clicking
+// any button on the card, or until a newer event replaces it. No automatic expiry — the user
+// asked for permanent visibility since Claude often answers faster than they can react.
+let _permStickyCard = null;
+let _questionStickyCard = null;
+function dismissStickyPermission() {
+  if (_permStickyCard) { _permStickyCard = null; reconcileSurface(); render(); }
+}
+function dismissStickyQuestion() {
+  if (_questionStickyCard) { _questionStickyCard = null; reconcileSurface(); render(); }
+}
 function renderPermissions(permissions) {
+  // If live pending has drained but we have a sticky card, keep showing it indefinitely.
+  // User must click Allow/Deny/Always (or a new event arrives) to dismiss. Buttons will still
+  // fire the IPC even if the bridge closed — main-side approvePermission is a no-op when the
+  // pending id is unknown, so this is safe.
+  if (permissions.length === 0 && _permStickyCard) {
+    permissionsSection.style.display = 'block';
+    return;
+  }
   permissionsList.innerHTML = '';
-  if (permissions.length === 0) { permissionsSection.style.display = 'none'; _lastRenderedPermissionId = null; return; }
+  if (permissions.length === 0) {
+    permissionsSection.style.display = 'none';
+    _lastRenderedPermissionId = null;
+    return;
+  }
   permissionsSection.style.display = 'block';
   for (const p of permissions) {
     permissionsList.appendChild(buildPermissionCard(p));
   }
+  _permStickyCard = permissions[0];
+  try {
+    const rect = permissionsSection.getBoundingClientRect();
+    const cs = getComputedStyle(permissionsSection);
+    const contentEl = document.getElementById('content');
+    const islandEl = document.getElementById('island');
+    const contentCls = contentEl ? contentEl.className : '?';
+    const islandCls = islandEl ? islandEl.className : '?';
+    const contentCs = contentEl ? getComputedStyle(contentEl) : null;
+    const contentMaxH = contentCs ? contentCs.maxHeight : '?';
+    const contentOpacity = contentCs ? contentCs.opacity : '?';
+    console.log(`[perm] render count=${permissions.length} expanded=${isExpanded} sectionDisplay=${cs.display} rect=${rect.width}x${rect.height}@${rect.top},${rect.left} children=${permissionsList.children.length}`);
+    const islandCs = islandEl ? getComputedStyle(islandEl) : null;
+    const islandTransform = islandCs ? islandCs.transform : '?';
+    const islandRect = islandEl ? islandEl.getBoundingClientRect() : {top:0,height:0};
+    console.log(`[perm] container islandCls="${islandCls}" contentCls="${contentCls}" contentMaxH=${contentMaxH} contentOpacity=${contentOpacity} islandTransform=${islandTransform} islandRect=${islandRect.height}@${islandRect.top}`);
+    setTimeout(() => {
+      try {
+        const cs2 = contentEl ? getComputedStyle(contentEl) : null;
+        const rect2 = permissionsSection.getBoundingClientRect();
+        console.log(`[perm] after-500ms contentMaxH=${cs2 ? cs2.maxHeight : '?'} contentOpacity=${cs2 ? cs2.opacity : '?'} sectionRect=${rect2.width}x${rect2.height}@${rect2.top}`);
+      } catch {}
+    }, 500);
+  } catch {}
   // Play sound only when a new permission card appears (not on every re-render).
   const headId = permissions[0]?.id;
   if (headId && headId !== _lastRenderedPermissionId) {
@@ -826,7 +974,10 @@ function buildPermissionCard(p) {
     const b = document.createElement('button');
     b.className = cls;
     b.textContent = label;
-    b.addEventListener('click', () => window.codePeek.approvePermission(p.id, behavior));
+    b.addEventListener('click', () => {
+      window.codePeek.approvePermission(p.id, behavior);
+      dismissStickyPermission();
+    });
     return b;
   };
   actions.appendChild(mkBtn('btn-allow', currentDict.btnAllow, 'allow'));
@@ -839,12 +990,21 @@ function buildPermissionCard(p) {
 
 let _lastRenderedQuestionId = null;
 function renderQuestions(questions) {
+  if (questions.length === 0 && _questionStickyCard) {
+    questionsSection.style.display = 'block';
+    return;
+  }
   questionsList.innerHTML = '';
-  if (questions.length === 0) { questionsSection.style.display = 'none'; _lastRenderedQuestionId = null; return; }
+  if (questions.length === 0) {
+    questionsSection.style.display = 'none';
+    _lastRenderedQuestionId = null;
+    return;
+  }
   questionsSection.style.display = 'block';
   for (const q of questions) {
     questionsList.appendChild(buildQuestionCard(q));
   }
+  _questionStickyCard = questions[0];
   // Play sound only when a new question card appears (not on every re-render).
   const headId = questions[0]?.id;
   if (headId && headId !== _lastRenderedQuestionId) {
@@ -875,6 +1035,7 @@ function buildQuestionCard(q) {
       optBtn.addEventListener('click', () => {
         const num = line.match(/^\s*(\d+)/);
         window.codePeek.answerQuestion(q.id, num ? num[1] : line.trim());
+        dismissStickyQuestion();
       });
       optBtn.addEventListener('mouseenter', () => optBtn.classList.add('hovered'));
       optBtn.addEventListener('mouseleave', () => optBtn.classList.remove('hovered'));
@@ -893,7 +1054,7 @@ function buildQuestionCard(q) {
   input.placeholder = currentDict.questionPlaceholder;
   const send = () => {
     const v = input.value.trim();
-    if (v) window.codePeek.answerQuestion(q.id, v);
+    if (v) { window.codePeek.answerQuestion(q.id, v); dismissStickyQuestion(); }
   };
   input.addEventListener('keydown', (e) => { if (e.key === 'Enter') send(); });
 
@@ -957,7 +1118,15 @@ async function handleSessionClick(card, event) {
   showToast(currentDict.menuJumping, 'success');
   const result = await window.codePeek.jumpToTerminal(pid, sessionName, cwd);
   if (result.success) showToast(currentDict.menuSwitched, 'success');
-  else showToast(`${currentDict.menuJumpFailed}: ${result.error || 'Unknown'}`, 'error');
+  else {
+    // NO_WINDOW / No ancestors usually mean the terminal was closed.
+    const err = result.error || '';
+    if (/NO_WINDOW|No ancestors/i.test(err)) {
+      showToast(currentDict.sessionClosed || 'Terminal closed — refreshing', 'error');
+    } else {
+      showToast(`${currentDict.menuJumpFailed}: ${err || 'Unknown'}`, 'error');
+    }
+  }
 }
 
 // Permission / question button handlers are bound inside buildPermissionCard / buildQuestionCard.
@@ -1116,9 +1285,13 @@ function populateSettings() {
   document.getElementById('chkStartOnLogin').checked = currentConfig.startOnLogin;
 
   const selDisplay = document.getElementById('selDisplay');
-  selDisplay.innerHTML = currentDisplays.map(d =>
-    `<option value="${d.id}">${d.label}${d.primary ? ' (Primary)' : ''}</option>`
-  ).join('');
+  selDisplay.innerHTML = '';
+  for (const d of currentDisplays) {
+    const opt = document.createElement('option');
+    opt.value = String(d.id);
+    opt.textContent = `${d.label || 'Display ' + d.id}${d.primary ? ' (Primary)' : ''}`;
+    selDisplay.appendChild(opt);
+  }
   selDisplay.value = currentConfig.displayId || (currentDisplays.find(d => d.primary)?.id || '');
 
   // Behavior

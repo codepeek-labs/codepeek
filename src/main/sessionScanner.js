@@ -41,10 +41,54 @@ class SessionScanner {
     this._procMap = new Map();
     this._procTableRefreshing = false;
     this._procTableLastRefresh = 0;
+    // PIDs confirmed to have no windowed ancestor (e.g. from a failed jump-to-terminal).
+    // Stored as Map<pid, createdAt> so we can detect PID reuse: if the current process
+    // with that PID has a different createdAt, the old record is obsolete.
+    this._orphanedPids = new Map();
     // Cache for recently-closed sessions
     this._historyCache = [];
     this._historyLastScan = 0;
     this._refreshProcTable();
+  }
+
+  get procMap() { return this._procMap; }
+
+  // Mark a PID as having no usable terminal window (orphaned process).
+  // These sessions will be reported as stale regardless of process liveness.
+  markOrphaned(pid) {
+    const n = parseInt(pid);
+    if (n <= 0) return;
+    const info = this._procMap.get(n);
+    this._orphanedPids.set(n, info ? (info.createdAt || 0) : 0);
+  }
+
+  // Returns true iff this PID is orphaned AND the record matches the current process
+  // (same createdAt). Prevents false positives after PID reuse.
+  isOrphaned(pid) {
+    if (!this._orphanedPids.has(pid)) return false;
+    const recordedCreatedAt = this._orphanedPids.get(pid);
+    const info = this._procMap.get(pid);
+    if (!info) {
+      // Process exited; clean up the stale record.
+      this._orphanedPids.delete(pid);
+      return false;
+    }
+    // If createdAt differs, this is a reused PID — the orphan record is obsolete.
+    if (recordedCreatedAt && info.createdAt && recordedCreatedAt !== info.createdAt) {
+      this._orphanedPids.delete(pid);
+      return false;
+    }
+    return true;
+  }
+
+  get orphanedPids() {
+    // Return a live Set for callers that just need PID membership checks (pruneDeadSessions).
+    // Cleanup happens on the `isOrphaned(pid)` path.
+    const live = new Set();
+    for (const pid of this._orphanedPids.keys()) {
+      if (this.isOrphaned(pid)) live.add(pid);
+    }
+    return live;
   }
 
   start(onUpdate) {
@@ -66,13 +110,36 @@ class SessionScanner {
     this._scan();
   }
 
+  // Force a process-table refresh + scan. Use when we suspect processes have died
+  // (e.g. jump-to-terminal returned NO_WINDOW). Awaits the async proc-table fetch.
+  async refreshNowForced() {
+    this._procTableLastRefresh = 0;
+    await this._refreshProcTable();
+    this._scan();
+  }
+
   _scan() {
     try {
       if (Date.now() - this._procTableLastRefresh > 3000) {
         this._refreshProcTable();
       }
       const sessions = this._readSessions();
-      const enriched = sessions.map(s => this._enrichSession(s));
+      const enrichedRaw = sessions.map(s => this._enrichSession(s));
+
+      // Claude writes a new ~/.claude/sessions/{pid}.json on every resume without removing the
+      // previous one, so the same sessionId can appear twice (once alive, once dead). Keep the
+      // alive record; if both are dead, keep the newer startedAt.
+      const byId = new Map();
+      for (const s of enrichedRaw) {
+        const prev = byId.get(s.id);
+        if (!prev) { byId.set(s.id, s); continue; }
+        const prevAlive = prev.isRunning !== false;
+        const curAlive = s.isRunning !== false;
+        if (curAlive && !prevAlive) { byId.set(s.id, s); continue; }
+        if (!curAlive && prevAlive) continue;
+        if ((s.startedAt || 0) > (prev.startedAt || 0)) byId.set(s.id, s);
+      }
+      const enriched = Array.from(byId.values());
 
       // Merge recently-closed sessions in. Disk is rescanned every 30s; the result is cached in between.
       const activeIds = new Set(enriched.filter(s => s.isRunning !== false).map(s => s.id));
@@ -312,9 +379,9 @@ class SessionScanner {
   }
 
   // Pull the full process list once via PowerShell: PID; ParentPID; Name; CreatedAt(ms since epoch).
+  // Returns a promise that resolves when procMap is updated.
   _refreshProcTable() {
-    if (this._procTableRefreshing) return;
-    this._procTableRefreshing = true;
+    if (this._procTableRefreshing) return this._procTableRefreshing;
     this._procTableLastRefresh = Date.now();
 
     const psScript = `
@@ -333,31 +400,44 @@ foreach ($p in $procs) {
   Write-Output "$pid2;$par;$name;$ct"
 }
 `;
-    const ps = spawn('powershell.exe', [
-      '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', psScript
-    ], { windowsHide: true, timeout: 8000 });
 
-    let buf = '';
-    ps.stdout.on('data', d => { buf += d.toString(); });
-    ps.stderr.on('data', () => {});
-    ps.on('close', () => {
-      this._procTableRefreshing = false;
-      const next = new Map();
-      for (const line of buf.split('\n')) {
-        const parts = line.trim().split(';');
-        if (parts.length >= 4) {
-          const pid = parseInt(parts[0]);
-          if (!pid) continue;
-          next.set(pid, {
-            name: parts[2] || '',
-            parentPid: parseInt(parts[1]) || 0,
-            createdAt: parseInt(parts[3]) || 0
-          });
+    this._procTableRefreshing = new Promise((resolve) => {
+      const ps = spawn('powershell.exe', [
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', psScript
+      ], { windowsHide: true, timeout: 8000 });
+
+      let buf = '';
+      ps.stdout.on('data', d => { buf += d.toString(); });
+      ps.stderr.on('data', () => {});
+      const finish = () => {
+        this._procTableRefreshing = false;
+        const next = new Map();
+        for (const line of buf.split('\n')) {
+          const parts = line.trim().split(';');
+          if (parts.length >= 4) {
+            const pid = parseInt(parts[0]);
+            if (!pid) continue;
+            next.set(pid, {
+              name: parts[2] || '',
+              parentPid: parseInt(parts[1]) || 0,
+              createdAt: parseInt(parts[3]) || 0
+            });
+          }
         }
-      }
-      if (next.size > 0) this._procMap = next;
+        // Update the existing Map in-place instead of reassigning — other modules (terminalFocus)
+        // hold a reference to this._procMap; reassigning would leave them pointing at a stale copy
+        // until the next setProcMap() call, which creates a ~5s window where jumpToTerminal fails
+        // with "No ancestors for PID" even though the process is actually in the fresh table.
+        if (next.size > 0) {
+          this._procMap.clear();
+          for (const [k, v] of next) this._procMap.set(k, v);
+        }
+        resolve();
+      };
+      ps.on('close', finish);
+      ps.on('error', () => { this._procTableRefreshing = false; resolve(); });
     });
-    ps.on('error', () => { this._procTableRefreshing = false; });
+    return this._procTableRefreshing;
   }
 
   // Liveness detection with orphan-process guard.
@@ -371,9 +451,13 @@ foreach ($p in $procs) {
     if (!pid || pid <= 0) return null;
     if (this._procMap.size === 0) return null; // process table not loaded yet
 
+    // Explicitly marked as orphaned (e.g. jump-to-terminal found no windowed ancestor).
+    if (this.isOrphaned(pid)) return false;
+
     const node = this._procMap.get(pid);
-    if (!node) return false;                            // node process has exited
-    if (!/^node(\.exe)?$/i.test(node.name)) return false; // PID was recycled into another program
+    if (!node) { this._orphanedPids.delete(pid); return false; }  // clean up, node process has exited
+    // Claude CLI 2.x ships as a native claude.exe; older versions ran as `node claude.js`. Accept both.
+    if (!/^(node|claude)(\.exe)?$/i.test(node.name)) return false; // PID was recycled into another program
 
     // Second PID-reuse guard: the node process must have started close to session.startedAt.
     // Claude CLI writes session.json immediately before forking node, so the delta is tiny.
@@ -555,6 +639,11 @@ foreach ($p in $procs) {
       scanTitles(tailLines);
       if (!result.customTitle) scanTitles(headLines);
 
+      // Cap cache at 50 entries to prevent unbounded growth.
+      while (this._conversationCache.size >= 50) {
+        const oldest = this._conversationCache.keys().next().value;
+        this._conversationCache.delete(oldest);
+      }
       this._conversationCache.set(cacheKey, {
         mtime: stat.mtimeMs,
         data: {

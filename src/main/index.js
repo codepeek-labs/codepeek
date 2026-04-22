@@ -6,7 +6,7 @@ const SessionManager = require('./sessionManager');
 const HookServer = require('./hookServer');
 const hookInstaller = require('./hookInstaller');
 const SessionScanner = require('./sessionScanner');
-const { focusTerminalByPid } = require('./terminalFocus');
+const { focusTerminalByPid, setProcMap } = require('./terminalFocus');
 const { launchSession } = require('./terminalLauncher');
 const config = require('./config');
 const { getDict, resolveLang, setElectronLocale } = require('./i18n');
@@ -79,7 +79,10 @@ app.whenReady().then(async () => {
   }
 
   sessionScanner = new SessionScanner();
-  sessionScanner.start((scanned) => sessionManager.updateScannedSessions(scanned));
+  sessionScanner.start((scanned) => {
+    sessionManager.updateScannedSessions(scanned);
+    setProcMap(sessionScanner.procMap);
+  });
 
   sessionManager.on('state-changed', () => {
     if (mainWindow && !mainWindow.isDestroyed()) {
@@ -90,9 +93,6 @@ app.whenReady().then(async () => {
   // Forward completion events to the renderer.
   // When suppressNotifications=true we skip the UI card entirely.
   sessionManager.on('completion', (payload) => {
-    const logLine = `${new Date().toISOString()} [completion] session=${payload.sessionId} project=${payload.projectName} title=${payload.sessionTitle} agent=${payload.agent}\n`;
-    console.log(logLine.trim());
-    require('fs').appendFile(require('path').join(require('os').homedir(), '.codepeek', 'sound.log'), logLine, () => {});
     if (config.get('suppressNotifications') === true) return;
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('completion-notify', payload);
@@ -110,9 +110,6 @@ app.whenReady().then(async () => {
       complete: 'soundOnComplete'
     };
     if (!config.get(keyMap[type])) return;
-    const logLine = `${new Date().toISOString()} [sound] type=${type} session=${meta?.sessionId || '?'} agent=${meta?.agent || '?'}\n`;
-    console.log(logLine.trim());
-    require('fs').appendFile(require('path').join(require('os').homedir(), '.codepeek', 'sound.log'), logLine, () => {});
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('play-sound', type);
     }
@@ -213,6 +210,16 @@ function createWindow() {
   });
 
   mainWindow.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
+
+  // Forward renderer console.log to a debug log file (for completion lifecycle tracing).
+  mainWindow.webContents.on('console-message', (_, level, message) => {
+    if (message.startsWith('[completion]') || message.startsWith('[jump-debug]') || message.startsWith('[perm]') || message.startsWith('[notif]')) {
+      require('fs').appendFile(
+        require('path').join(require('os').homedir(), '.codepeek', 'debug.log'),
+        `${new Date().toISOString()} ${message}\n`, () => {}
+      );
+    }
+  });
 
   // Default to mouse-passthrough so clicks aren't captured by the transparent window.
   // forward:true still delivers mousemove events so we can detect hover. The renderer
@@ -442,7 +449,20 @@ function registerIPC() {
     if (!n || n <= 0) return { success: false, error: 'Invalid PID' };
     const name = typeof sessionName === 'string' ? sessionName.substring(0, 100) : '';
     const wd = typeof cwd === 'string' ? cwd.substring(0, 500) : '';
-    return await focusTerminalByPid(n, name, wd);
+    const result = await focusTerminalByPid(n, name, wd);
+    // If jump failed, force-refresh the process table so state reflects reality.
+    // Only NO_WINDOW (a confirmed windowless ancestor chain) marks the PID as orphaned;
+    // "No ancestors" can happen transiently when the procMap is cold/stale and should not
+    // be treated as a permanent orphan state.
+    if (!result.success && sessionScanner) {
+      const err = String(result.error || '');
+      if (/NO_WINDOW/i.test(err)) {
+        sessionScanner.markOrphaned(n);
+      }
+      await sessionScanner.refreshNowForced();
+      sessionManager.pruneDeadSessions(sessionScanner.procMap, sessionScanner.orphanedPids);
+    }
+    return result;
   });
 
   secureHandle('launch-session', (_, sessionId, cwd, agent) => {
@@ -456,12 +476,26 @@ function registerIPC() {
 
   secureHandle('refresh-sessions', () => { if (sessionScanner) sessionScanner.refreshNow(); });
 
+
   // Expose the real screen cursor position for the renderer's safety poll.
   // This does NOT depend on renderer mouse events — works even when setIgnoreMouseEvents is active.
   secureHandle('get-cursor-screen-point', () => {
     const cursor = screen.getCursorScreenPoint();
     const win = mainWindow && !mainWindow.isDestroyed() ? mainWindow.getBounds() : null;
     return { screenX: cursor.x, screenY: cursor.y, winBounds: win };
+  });
+
+  secureHandle('dump-window-state', () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return { error: 'destroyed' };
+    const b = mainWindow.getBounds();
+    const disp = screen.getDisplayMatching(b);
+    const all = screen.getAllDisplays().map(d => ({ id: d.id, bounds: d.bounds, wa: d.workArea, primary: d === screen.getPrimaryDisplay() }));
+    return {
+      bounds: b, visible: mainWindow.isVisible(), minimized: mainWindow.isMinimized(),
+      focused: mainWindow.isFocused(), alwaysOnTop: mainWindow.isAlwaysOnTop(),
+      display: { id: disp.id, bounds: disp.bounds, workArea: disp.workArea },
+      allDisplays: all
+    };
   });
 
   secureHandle('approve-permission', (_, requestId, behavior) => {

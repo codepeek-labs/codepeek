@@ -66,18 +66,22 @@ function launchSession({ sessionId, cwd, agent }) {
     resumeArgs = ['--resume', cleanId];
   }
 
+  // Build a PowerShell command that invokes the CLI and stays open (-NoExit).
+  // Using -Command with the invocation operator "&" handles quoting safely.
+  const psArgList = resumeArgs.map(a => `'${String(a).replace(/'/g, "''")}'`).join(' ');
+  const psCommand = `& ${cliCmd} ${psArgList}`;
+
   try {
     if (term.type === 'wt') {
       // Windows Terminal: prefer adding a tab to the most recently used window; if no WT window
       // exists, a new one is created automatically.
-      // Args: -w last new-tab -d <cwd> --title <title> cmd /k claude --resume <id>
       const titlePrefix = agent === 'codex' ? 'Codex' : 'Claude';
       const child = spawn(term.exe, [
         '-w', 'last',
         'new-tab',
         '-d', workDir,
         '--title', `${titlePrefix} · ${cleanId.substring(0, 8)}`,
-        'cmd.exe', '/k', cliCmd, ...resumeArgs
+        'powershell.exe', '-NoLogo', '-NoExit', '-Command', psCommand
       ], {
         detached: true,
         stdio: 'ignore',
@@ -86,19 +90,18 @@ function launchSession({ sessionId, cwd, agent }) {
       child.unref();
       return { success: true, terminal: 'wt' };
     } else {
-      // cmd.exe fallback: open a new window via `start`.
-      // Note: the first quoted argument to `start` is treated as the window title, so we pass an empty "".
+      // PowerShell fallback: open a new window via `start`.
       const child = spawn('cmd.exe', [
         '/c', 'start', '""',
         '/D', workDir,
-        'cmd.exe', '/k', cliCmd, ...resumeArgs
+        'powershell.exe', '-NoLogo', '-NoExit', '-Command', psCommand
       ], {
         detached: true,
         stdio: 'ignore',
         windowsHide: false
       });
       child.unref();
-      return { success: true, terminal: 'cmd' };
+      return { success: true, terminal: 'powershell' };
     }
   } catch (err) {
     return { success: false, error: err.message };

@@ -136,6 +136,8 @@ class HookServer {
 
       const eventName = event.hook_event_name || event.event_name || event.event || '';
       const isBlocking = eventName === 'PermissionRequest' || eventName === 'Notification';
+      try { require('fs').appendFile(require('path').join(require('os').homedir(), '.codepeek', 'debug.log'),
+        `${new Date().toISOString()} [hook] evt=${eventName} blocking=${isBlocking} sid=${event.session_id} src=${event._source}\n`, () => {}); } catch {}
 
       if (isBlocking) {
         let settled = false;

@@ -2,6 +2,13 @@
 
 const { spawn } = require('child_process');
 
+// Process table injected by the main module (from sessionScanner._procMap).
+let _procMap = new Map();
+
+function setProcMap(map) {
+  _procMap = map;
+}
+
 function buildCandidateNames(sessionName, cwd) {
   const out = [];
   const push = (s) => {
@@ -24,84 +31,61 @@ function buildCandidateNames(sessionName, cwd) {
   return out.slice(0, 8);
 }
 
-function buildScript(nodePid, sessionName, cwd) {
+// Build ancestor chain in Node.js using the cached process table (no WMI needed).
+function getAncestorChain(pid) {
+  const ancestors = [];
+  let current = pid;
+  let lastCreatedAt = 0;
+  for (let i = 0; i < 20; i++) {
+    const info = _procMap.get(current);
+    if (!info) break;
+    // PID reuse guard: parent must have been created before the child.
+    if (lastCreatedAt > 0 && info.createdAt > 0 && info.createdAt > lastCreatedAt) break;
+    lastCreatedAt = info.createdAt || 0;
+    const parent = info.parentPid;
+    if (!parent || parent <= 0 || parent === current) break;
+    if (ancestors.includes(parent)) break;
+    ancestors.push(parent);
+    current = parent;
+  }
+  return ancestors;
+}
+
+// Minimal PowerShell script: only does window focusing + tab switching.
+// No CIM queries, no process validation — all done in Node.js already.
+function buildFocusScript(ancestorPids, sessionName, cwd) {
   const safeName = (sessionName || '').replace(/['`\$]/g, '').substring(0, 100);
   const cands = buildCandidateNames(sessionName, cwd)
     .map(c => "'" + c.replace(/['`\$]/g, '').substring(0, 200) + "'");
   const candList = cands.length ? cands.join(',') : "''";
+  const pidArray = ancestorPids.join(',');
   return `
-$NodePid = ${nodePid}
+$AncestorPids = @(${pidArray})
 $TargetName = '${safeName}'
 $Candidates = @(${candList})
-
-$procTable = @{}
-$procNames = @{}
-$procCmdLines = @{}
-try {
-  $all = Get-CimInstance Win32_Process -ErrorAction Stop
-  foreach ($p in $all) {
-    $thisPid = [int]$p.ProcessId
-    $procTable[$thisPid] = [int]$p.ParentProcessId
-    $procNames[$thisPid] = $p.Name
-    $procCmdLines[$thisPid] = if ($p.CommandLine) { $p.CommandLine } else { "" }
-  }
-} catch {
-  Write-Host "CIM_FAIL:$($_.Exception.Message)"
-  exit 1
-}
-
-# Defense against PID reuse
-$cmdLine = if ($procCmdLines.ContainsKey($NodePid)) { $procCmdLines[$NodePid] } else { "" }
-$nameCheck = if ($procNames.ContainsKey($NodePid)) { $procNames[$NodePid] } else { "" }
-$isNodeProc = $nameCheck -match '^(node|node\\.exe)$'
-$isCodexProc = $nameCheck -match '^(codex|codex\\.exe)$'
-$isClaudeCmd = $cmdLine -match '(claude-code|cli\\.js)' -or $cmdLine -match 'claude'
-$isCodexCmd = $cmdLine -match 'codex'
-if (-not (($isNodeProc -and ($isClaudeCmd -or $isCodexCmd)) -or $isCodexProc)) {
-  Write-Host "PID_NOT_AGENT:pid=$NodePid,name=$nameCheck"
-  exit 1
-}
-
-# Build the ancestor chain
-$ancestors = @()
-$current = $NodePid
-for ($i = 0; $i -lt 20; $i++) {
-  if (-not $procTable.ContainsKey($current)) { break }
-  $parent = $procTable[$current]
-  if ($parent -le 0 -or $parent -eq $current) { break }
-  if ($ancestors -contains $parent) { break }
-  $ancestors += $parent
-  $current = $parent
-}
-
-if ($ancestors.Count -eq 0) {
-  Write-Host "NO_ANCESTORS:pid=$NodePid"
-  exit 1
-}
 
 # Find the first ancestor with a top-level window
 $targetHwnd = [IntPtr]::Zero
 $targetPid = 0
 $isWindowsTerminal = $false
 
-foreach ($apid in $ancestors) {
+foreach ($apid in $AncestorPids) {
   try {
     $proc = Get-Process -Id $apid -ErrorAction SilentlyContinue
     if ($proc -and $proc.MainWindowHandle -ne [IntPtr]::Zero) {
       $targetHwnd = $proc.MainWindowHandle
       $targetPid = $apid
-      if ($procNames[$apid] -match '^WindowsTerminal') { $isWindowsTerminal = $true }
+      if ($proc.ProcessName -match '^WindowsTerminal') { $isWindowsTerminal = $true }
       break
     }
   } catch {}
 }
 
 if ($targetHwnd -eq [IntPtr]::Zero) {
-  Write-Host "NO_WINDOW:pid=$NodePid"
+  Write-Host "NO_WINDOW"
   exit 1
 }
 
-# Activate the window first
 Add-Type @"
 using System;
 using System.Runtime.InteropServices;
@@ -117,18 +101,17 @@ if (-not [W]::IsWindow($targetHwnd)) { Write-Host "INVALID_HWND"; exit 1 }
 
 if ([W]::IsIconic($targetHwnd)) {
   [W]::ShowWindowAsync($targetHwnd, 9) | Out-Null
-  Start-Sleep -Milliseconds 100
+  Start-Sleep -Milliseconds 50
 }
 [W]::SetForegroundWindow($targetHwnd) | Out-Null
 
-# For Windows Terminal, try to select the matching tab via UIAutomation.
 $tabResult = "no-tab-switch"
 if ($isWindowsTerminal -and $TargetName) {
   try {
     Add-Type -AssemblyName UIAutomationClient -ErrorAction Stop
     Add-Type -AssemblyName UIAutomationTypes -ErrorAction Stop
 
-    Start-Sleep -Milliseconds 120
+    Start-Sleep -Milliseconds 50
 
     $root = [System.Windows.Automation.AutomationElement]::RootElement
     $pidCond = New-Object System.Windows.Automation.PropertyCondition(
@@ -142,7 +125,7 @@ if ($isWindowsTerminal -and $TargetName) {
       $tabs = $windowEl.FindAll([System.Windows.Automation.TreeScope]::Descendants, $tabCond)
 
       $matched = $null
-      $matchedScore = 0  # 3=exact, 2=substring, 1=normalized substring
+      $matchedScore = 0
       foreach ($tab in $tabs) {
         $tabName = $tab.Current.Name
         if (-not $tabName) { continue }
@@ -195,10 +178,16 @@ function focusTerminalByPid(pid, sessionName, cwd) {
       return resolve({ success: false, error: `Invalid PID: ${pid}` });
     }
 
+    // Build ancestor chain in Node.js (instant, no WMI).
+    const ancestors = getAncestorChain(numericPid);
+    if (ancestors.length === 0) {
+      return resolve({ success: false, error: `No ancestors for PID ${pid}` });
+    }
+
     const ps = spawn('powershell.exe', [
-      '-NoProfile', '-ExecutionPolicy', 'Bypass',
-      '-Command', buildScript(numericPid, sessionName, cwd)
-    ], { windowsHide: true, timeout: 12000 });
+      '-NoProfile', '-NoLogo', '-ExecutionPolicy', 'Bypass',
+      '-Command', buildFocusScript(ancestors, sessionName, cwd)
+    ], { windowsHide: true, timeout: 8000 });
 
     let output = '';
     ps.stdout.on('data', d => { output += d.toString(); });
@@ -217,4 +206,4 @@ function focusTerminalByPid(pid, sessionName, cwd) {
   });
 }
 
-module.exports = { focusTerminalByPid };
+module.exports = { focusTerminalByPid, setProcMap };
