@@ -36,6 +36,8 @@ const DICT = {
     btnAllow: 'Allow',
     btnDeny: 'Deny',
     btnAlways: 'Always',
+    btnSubmit: 'Submit',
+    tabAsk: 'Question',
 
     // Question
     questions: 'Questions',
@@ -157,6 +159,8 @@ const DICT = {
     btnAllow: '允许',
     btnDeny: '拒绝',
     btnAlways: '始终允许',
+    btnSubmit: '提交',
+    tabAsk: '提问',
 
     questions: '问题',
     questionPlaceholder: '输入回答...',

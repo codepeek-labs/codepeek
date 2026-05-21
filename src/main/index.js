@@ -212,8 +212,15 @@ function createWindow() {
   mainWindow.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
 
   // Forward renderer console.log to a debug log file (for completion lifecycle tracing).
-  mainWindow.webContents.on('console-message', (_, level, message) => {
-    if (message.startsWith('[completion]') || message.startsWith('[jump-debug]') || message.startsWith('[perm]') || message.startsWith('[notif]')) {
+  // Forward selected renderer console.log lines to a debug log file. Electron 28+ changed the
+  // console-message signature to a single Event object — keep a fallback for older versions.
+  mainWindow.webContents.on('console-message', (...args) => {
+    const evt = args[0];
+    const message = (evt && typeof evt === 'object' && typeof evt.message === 'string')
+      ? evt.message
+      : args[2];
+    if (typeof message !== 'string') return;
+    if (message.startsWith('[completion]')) {
       require('fs').appendFile(
         require('path').join(require('os').homedir(), '.codepeek', 'debug.log'),
         `${new Date().toISOString()} ${message}\n`, () => {}
@@ -485,23 +492,21 @@ function registerIPC() {
     return { screenX: cursor.x, screenY: cursor.y, winBounds: win };
   });
 
-  secureHandle('dump-window-state', () => {
-    if (!mainWindow || mainWindow.isDestroyed()) return { error: 'destroyed' };
-    const b = mainWindow.getBounds();
-    const disp = screen.getDisplayMatching(b);
-    const all = screen.getAllDisplays().map(d => ({ id: d.id, bounds: d.bounds, wa: d.workArea, primary: d === screen.getPrimaryDisplay() }));
-    return {
-      bounds: b, visible: mainWindow.isVisible(), minimized: mainWindow.isMinimized(),
-      focused: mainWindow.isFocused(), alwaysOnTop: mainWindow.isAlwaysOnTop(),
-      display: { id: disp.id, bounds: disp.bounds, workArea: disp.workArea },
-      allDisplays: all
-    };
-  });
-
-  secureHandle('approve-permission', (_, requestId, behavior) => {
+  secureHandle('approve-permission', (_, requestId, behavior, answers) => {
     if (typeof requestId !== 'string') return;
     if (!['allow', 'deny', 'always'].includes(behavior)) return;
-    sessionManager.approvePermission(requestId, behavior);
+    // answers (optional, only for AskUserQuestion): { [questionText]: selectedLabel } or
+    // { [questionText]: [labels] } for multiSelect.
+    let sanitizedAnswers = null;
+    if (answers && typeof answers === 'object' && !Array.isArray(answers)) {
+      sanitizedAnswers = {};
+      for (const [k, v] of Object.entries(answers)) {
+        if (typeof k !== 'string') continue;
+        if (typeof v === 'string') sanitizedAnswers[k] = v.substring(0, 4000);
+        else if (Array.isArray(v)) sanitizedAnswers[k] = v.filter(x => typeof x === 'string').slice(0, 64).map(x => x.substring(0, 4000));
+      }
+    }
+    sessionManager.approvePermission(requestId, behavior, sanitizedAnswers);
   });
 
   secureHandle('answer-question', (_, requestId, answer) => {

@@ -499,6 +499,34 @@ html, body {
 }
 .permission-actions { display: flex; gap: 6px; }
 
+/* AskUserQuestion card: question text + selectable option buttons. */
+.permission-card-askuser .askuser-question {
+  display: flex; flex-direction: column; gap: 4px;
+  margin-bottom: 8px;
+}
+.askuser-header {
+  font-size: 10px; font-weight: 700; color: var(--accent-orange);
+  text-transform: uppercase; letter-spacing: 0.6px;
+}
+.askuser-text {
+  font-size: 12px; color: var(--text-primary); line-height: 1.4;
+}
+.askuser-options { display: flex; flex-direction: column; gap: 4px; margin-top: 4px; }
+.askuser-option {
+  background: var(--bg-tertiary); color: var(--text-primary);
+  border: 1px solid transparent; border-radius: 6px;
+  padding: 6px 10px; text-align: left; cursor: pointer;
+  font-family: inherit; transition: background 0.15s, border-color 0.15s;
+}
+.askuser-option:hover { background: var(--bg-secondary); }
+.askuser-option.selected {
+  background: rgba(48, 209, 88, 0.12);
+  border-color: var(--accent-green);
+}
+.askuser-option-label { font-size: 12px; font-weight: 600; color: var(--text-primary); }
+.askuser-option-desc { font-size: 11px; color: var(--text-secondary); margin-top: 2px; line-height: 1.35; }
+.btn-allow[disabled] { opacity: 0.4; cursor: not-allowed; }
+
 .btn-allow {
   background: var(--accent-green); color: #000; border: none;
   padding: 6px 14px; border-radius: var(--radius-btn);

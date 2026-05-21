@@ -75,9 +75,6 @@ async function init() {
 
   window.codePeek.onStateChanged(state => {
     currentState = state;
-    if ((state.pendingPermissions || []).length > 0 || (state.pendingQuestions || []).length > 0) {
-      console.log(`[perm] state-changed perms=${state.pendingPermissions.length} qs=${state.pendingQuestions.length} surface=${_surface}`);
-    }
     // A state-changed event may introduce/remove approval or question items; recompute surface.
     reconcileSurface();
     render();
@@ -174,10 +171,14 @@ function setSurface(next) {
       const xform = offsetX ? `translateY(-2px) translateX(${offsetX}px)` : 'translateY(-2px)';
       island.style.setProperty('transform', xform, 'important');
       island.style.setProperty('transition', 'none', 'important');
-      // Re-enable transitions on next frame so subsequent user-driven collapse/expand still animates.
+      // Re-enable transitions on next frame AND drop the !important transform so subsequent
+      // user-driven collapse/expand obeys the regular CSS rules. Without removing transform,
+      // the inline !important overrides .island / .island.expanded-state forever and the island
+      // gets stuck at translateY(-2px) — hover collapse/expand silently fails to move it.
       requestAnimationFrame(() => {
         content.style.removeProperty('transition');
         island.style.removeProperty('transition');
+        island.style.removeProperty('transform');
       });
     }
   }
@@ -312,14 +313,8 @@ function renderCompletionBody(data) {
       );
       if (parent) pid = parent.pid;
     }
-    console.log(`[jump-debug] click sid=${targetId} cwd=${cwd} pid=${pid} sessFound=${!!sess} sessIsRunning=${sess && sess.isRunning}`);
     if (pid) {
-      try {
-        const r = await window.codePeek.jumpToTerminal(pid, name, cwd);
-        console.log(`[jump-debug] result ok=${r && r.success} err=${r && r.error} detail=${r && r.detail}`);
-      } catch (err) {
-        console.log(`[jump-debug] throw ${err && err.message}`);
-      }
+      window.codePeek.jumpToTerminal(pid, name, cwd);
     } else {
       showToast(currentDict.menuNoPid || 'No PID for this session', 'error');
     }
@@ -454,6 +449,15 @@ function collapse() {
   isExpanded = false;
   manuallyPinned = false;
   _autoExpandedByEvent = false;
+
+  // Drop any event-surface inline !important styles that may have been forced earlier so the
+  // CSS rules (.content max-height:0, .island transform translateY(-100%+peek)) can take effect.
+  content.style.removeProperty('max-height');
+  content.style.removeProperty('opacity');
+  content.style.removeProperty('pointer-events');
+  content.style.removeProperty('transition');
+  island.style.removeProperty('transform');
+  island.style.removeProperty('transition');
 
   // Phase 1: fade out content quickly while keeping height stable for the slide.
   content.style.opacity = '0';
@@ -895,42 +899,27 @@ function renderPermissions(permissions) {
     permissionsSection.style.display = 'block';
     return;
   }
-  permissionsList.innerHTML = '';
   if (permissions.length === 0) {
     permissionsSection.style.display = 'none';
+    permissionsList.innerHTML = '';
     _lastRenderedPermissionId = null;
     return;
   }
+  // CRITICAL: do not rebuild DOM if the head permission id hasn't changed. Otherwise every
+  // scanner state-changed tick wipes the user's selected-option state on an AskUserQuestion card.
+  const headId = permissions[0].id;
+  if (headId === _lastRenderedPermissionId && permissionsList.children.length > 0) {
+    permissionsSection.style.display = 'block';
+    _permStickyCard = permissions[0];
+    return;
+  }
+  permissionsList.innerHTML = '';
   permissionsSection.style.display = 'block';
   for (const p of permissions) {
     permissionsList.appendChild(buildPermissionCard(p));
   }
   _permStickyCard = permissions[0];
-  try {
-    const rect = permissionsSection.getBoundingClientRect();
-    const cs = getComputedStyle(permissionsSection);
-    const contentEl = document.getElementById('content');
-    const islandEl = document.getElementById('island');
-    const contentCls = contentEl ? contentEl.className : '?';
-    const islandCls = islandEl ? islandEl.className : '?';
-    const contentCs = contentEl ? getComputedStyle(contentEl) : null;
-    const contentMaxH = contentCs ? contentCs.maxHeight : '?';
-    const contentOpacity = contentCs ? contentCs.opacity : '?';
-    console.log(`[perm] render count=${permissions.length} expanded=${isExpanded} sectionDisplay=${cs.display} rect=${rect.width}x${rect.height}@${rect.top},${rect.left} children=${permissionsList.children.length}`);
-    const islandCs = islandEl ? getComputedStyle(islandEl) : null;
-    const islandTransform = islandCs ? islandCs.transform : '?';
-    const islandRect = islandEl ? islandEl.getBoundingClientRect() : {top:0,height:0};
-    console.log(`[perm] container islandCls="${islandCls}" contentCls="${contentCls}" contentMaxH=${contentMaxH} contentOpacity=${contentOpacity} islandTransform=${islandTransform} islandRect=${islandRect.height}@${islandRect.top}`);
-    setTimeout(() => {
-      try {
-        const cs2 = contentEl ? getComputedStyle(contentEl) : null;
-        const rect2 = permissionsSection.getBoundingClientRect();
-        console.log(`[perm] after-500ms contentMaxH=${cs2 ? cs2.maxHeight : '?'} contentOpacity=${cs2 ? cs2.opacity : '?'} sectionRect=${rect2.width}x${rect2.height}@${rect2.top}`);
-      } catch {}
-    }, 500);
-  } catch {}
   // Play sound only when a new permission card appears (not on every re-render).
-  const headId = permissions[0]?.id;
   if (headId && headId !== _lastRenderedPermissionId) {
     _lastRenderedPermissionId = headId;
     playSound('permission');
@@ -938,6 +927,12 @@ function renderPermissions(permissions) {
 }
 
 function buildPermissionCard(p) {
+  // AskUserQuestion uses an entirely different schema: show the question(s) with selectable
+  // options, collect the user's picks, and send them back via approvePermission(_, 'allow', answers)
+  // which main-side wraps into hookSpecificOutput.decision.updatedInput.{questions, answers}.
+  if (p.toolName === 'AskUserQuestion' && Array.isArray(p.questions) && p.questions.length > 0) {
+    return buildAskUserCard(p);
+  }
   const card = document.createElement('div');
   card.className = 'permission-card';
   const tool = document.createElement('div');
@@ -983,6 +978,112 @@ function buildPermissionCard(p) {
   actions.appendChild(mkBtn('btn-allow', currentDict.btnAllow, 'allow'));
   actions.appendChild(mkBtn('btn-deny', currentDict.btnDeny, 'deny'));
   actions.appendChild(mkBtn('btn-always', currentDict.btnAlways, 'always'));
+  card.appendChild(actions);
+
+  return card;
+}
+
+// Renders a Claude AskUserQuestion permission card with rich question/option UI.
+// p.questions: array of { question, header, options[{label, description}], multiSelect }
+function buildAskUserCard(p) {
+  const card = document.createElement('div');
+  card.className = 'permission-card permission-card-askuser';
+
+  const tool = document.createElement('div');
+  tool.className = 'permission-tool';
+  tool.textContent = p.questions.length > 1
+    ? `${currentDict.tabAsk || 'Question'} (${p.questions.length})`
+    : (currentDict.tabAsk || 'Question');
+  card.appendChild(tool);
+
+  // Track user's selection per question index. Single-select stores a string; multi-select stores an array.
+  const selections = p.questions.map(q => q.multiSelect ? [] : null);
+
+  const submitBtn = document.createElement('button');
+  submitBtn.className = 'btn-allow';
+  submitBtn.textContent = currentDict.btnSubmit || 'Submit';
+  submitBtn.disabled = true;
+  const refreshSubmitState = () => {
+    const allAnswered = selections.every((sel, i) => {
+      if (p.questions[i].multiSelect) return Array.isArray(sel) && sel.length > 0;
+      return typeof sel === 'string' && sel.length > 0;
+    });
+    submitBtn.disabled = !allAnswered;
+  };
+
+  for (let qi = 0; qi < p.questions.length; qi++) {
+    const q = p.questions[qi];
+    const qBlock = document.createElement('div');
+    qBlock.className = 'askuser-question';
+    if (q.header) {
+      const h = document.createElement('div');
+      h.className = 'askuser-header';
+      h.textContent = String(q.header);
+      qBlock.appendChild(h);
+    }
+    const qt = document.createElement('div');
+    qt.className = 'askuser-text';
+    qt.textContent = String(q.question || '');
+    qBlock.appendChild(qt);
+
+    const optsWrap = document.createElement('div');
+    optsWrap.className = 'askuser-options';
+    const optionEls = [];
+    (q.options || []).forEach((opt) => {
+      const label = String(opt.label || '');
+      const desc = String(opt.description || '');
+      const btn = document.createElement('button');
+      btn.className = 'askuser-option';
+      const labelEl = document.createElement('div');
+      labelEl.className = 'askuser-option-label';
+      labelEl.textContent = label;
+      btn.appendChild(labelEl);
+      if (desc) {
+        const descEl = document.createElement('div');
+        descEl.className = 'askuser-option-desc';
+        descEl.textContent = desc;
+        btn.appendChild(descEl);
+      }
+      btn.addEventListener('click', () => {
+        if (q.multiSelect) {
+          const arr = selections[qi];
+          const idx = arr.indexOf(label);
+          if (idx >= 0) { arr.splice(idx, 1); btn.classList.remove('selected'); }
+          else { arr.push(label); btn.classList.add('selected'); }
+        } else {
+          selections[qi] = label;
+          optionEls.forEach(el => el.classList.remove('selected'));
+          btn.classList.add('selected');
+        }
+        refreshSubmitState();
+      });
+      optionEls.push(btn);
+      optsWrap.appendChild(btn);
+    });
+    qBlock.appendChild(optsWrap);
+    card.appendChild(qBlock);
+  }
+
+  const actions = document.createElement('div');
+  actions.className = 'permission-actions';
+  submitBtn.addEventListener('click', () => {
+    if (submitBtn.disabled) return;
+    const answers = {};
+    for (let i = 0; i < p.questions.length; i++) {
+      answers[p.questions[i].question] = selections[i];
+    }
+    window.codePeek.approvePermission(p.id, 'allow', answers);
+    dismissStickyPermission();
+  });
+  const denyBtn = document.createElement('button');
+  denyBtn.className = 'btn-deny';
+  denyBtn.textContent = currentDict.btnDeny || 'Deny';
+  denyBtn.addEventListener('click', () => {
+    window.codePeek.approvePermission(p.id, 'deny');
+    dismissStickyPermission();
+  });
+  actions.appendChild(submitBtn);
+  actions.appendChild(denyBtn);
   card.appendChild(actions);
 
   return card;

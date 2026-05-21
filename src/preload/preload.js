@@ -14,8 +14,8 @@ contextBridge.exposeInMainWorld('codePeek', {
   getDisplays: () => ipcRenderer.invoke('get-displays'),
 
   // Actions
-  approvePermission: (requestId, behavior) =>
-    ipcRenderer.invoke('approve-permission', requestId, behavior),
+  approvePermission: (requestId, behavior, answers) =>
+    ipcRenderer.invoke('approve-permission', requestId, behavior, answers),
   answerQuestion: (requestId, answer) =>
     ipcRenderer.invoke('answer-question', requestId, answer),
 
@@ -38,7 +38,6 @@ contextBridge.exposeInMainWorld('codePeek', {
   launchSession: (sessionId, cwd, agent) => ipcRenderer.invoke('launch-session', sessionId, cwd, agent),
   refreshSessions: () => ipcRenderer.invoke('refresh-sessions'),
   getCursorScreenPoint: () => ipcRenderer.invoke('get-cursor-screen-point'),
-  dumpWindowState: () => ipcRenderer.invoke('dump-window-state'),
 
   // Autostart
   toggleAutoStart: (enabled) => ipcRenderer.invoke('toggle-autostart', enabled),

@@ -87,11 +87,23 @@ class SessionManager extends EventEmitter {
     this.emit('state-changed');
   }
 
-  approvePermission(requestId, behavior) {
+  approvePermission(requestId, behavior, answers) {
     const pending = this.pendingPermissions.get(requestId);
     if (!pending) return;
     let response;
-    if (behavior === 'allow') {
+    // AskUserQuestion responses MUST include updatedInput.{questions, answers} per Claude's hook
+    // schema (sdk-tools.d.ts: answers keyed by question text -> selected option label).
+    if (pending.questions && behavior === 'allow' && answers) {
+      response = {
+        hookSpecificOutput: {
+          hookEventName: 'PermissionRequest',
+          decision: {
+            behavior: 'allow',
+            updatedInput: { questions: pending.questions, answers }
+          }
+        }
+      };
+    } else if (behavior === 'allow') {
       response = { hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'allow' } } };
     } else if (behavior === 'always') {
       response = {
@@ -210,7 +222,9 @@ class SessionManager extends EventEmitter {
     return {
       sessions: allSessions,
       pendingPermissions: Array.from(this.pendingPermissions.entries()).map(([id, p]) => ({
-        id, sessionId: p.sessionId, toolName: p.toolName, toolInput: p.toolInput, timestamp: p.timestamp
+        id, sessionId: p.sessionId, toolName: p.toolName, toolInput: p.toolInput,
+        questions: p.questions || null, // AskUserQuestion: raw questions array for rich rendering
+        timestamp: p.timestamp
       })),
       pendingQuestions: Array.from(this.pendingQuestions.entries()).map(([id, q]) => ({
         id, sessionId: q.sessionId, question: q.question, timestamp: q.timestamp
@@ -337,8 +351,6 @@ class SessionManager extends EventEmitter {
 
   _onPermissionRequest(sessionId, event, respond) {
     const toolName = event.tool_name || '';
-    try { require('fs').appendFile(require('path').join(require('os').homedir(), '.codepeek', 'debug.log'),
-      `${new Date().toISOString()} [perm] received sid=${sessionId} tool=${toolName}\n`, () => {}); } catch {}
     const BUILTIN_AUTO_APPROVE = ['TaskCreate','TaskUpdate','TaskGet','TaskList','TaskOutput','TaskStop','TodoRead','TodoWrite','EnterPlanMode','ExitPlanMode'];
     const userApprove = config.get('autoApproveTools') || [];
 
@@ -352,9 +364,15 @@ class SessionManager extends EventEmitter {
     }
 
     const requestId = `perm_${++this._requestCounter}`;
+    // AskUserQuestion needs the raw questions array preserved so the renderer can show options
+    // and so approvePermission can echo them back inside updatedInput (required by Claude).
+    const isAskUser = toolName === 'AskUserQuestion';
+    const questions = isAskUser && event.tool_input && Array.isArray(event.tool_input.questions)
+      ? event.tool_input.questions : null;
     this.pendingPermissions.set(requestId, {
       sessionId, toolName,
       toolInput: this._formatToolInput(toolName, event.tool_input),
+      questions,
       timestamp: Date.now(),
       respond: respond || (() => {})
     });
@@ -370,8 +388,6 @@ class SessionManager extends EventEmitter {
 
   _onNotification(sessionId, event, respond) {
     const question = event.message || event.notification || event.content || event.question || '';
-    try { require('fs').appendFile(require('path').join(require('os').homedir(), '.codepeek', 'debug.log'),
-      `${new Date().toISOString()} [notif] sid=${sessionId} src=${event._source} type=${event.notification_type} msg=${JSON.stringify(String(question).substring(0, 200))}\n`, () => {}); } catch {}
     // Claude CLI uses its own terminal TUI for any real question requiring user input. The
     // Notification hook is fired for idle pings ("Claude is waiting for your input"), tool-result
     // announcements, etc. — none of which we should surface as a blocking question card. If we

@@ -136,8 +136,6 @@ class HookServer {
 
       const eventName = event.hook_event_name || event.event_name || event.event || '';
       const isBlocking = eventName === 'PermissionRequest' || eventName === 'Notification';
-      try { require('fs').appendFile(require('path').join(require('os').homedir(), '.codepeek', 'debug.log'),
-        `${new Date().toISOString()} [hook] evt=${eventName} blocking=${isBlocking} sid=${event.session_id} src=${event._source}\n`, () => {}); } catch {}
 
       if (isBlocking) {
         let settled = false;
@@ -157,16 +155,20 @@ class HookServer {
         req.setTimeout(86400000);
         res.setTimeout(86400000);
 
-        // bridge disconnected: clean up any pending so the UI isn't stuck waiting.
+        // Bridge disconnected: clean up any pending so the UI isn't stuck waiting.
+        // IMPORTANT: do NOT listen on req.on('close') — Node.js fires it on the request stream's
+        // normal end-of-body lifecycle, not only on socket disconnect, so it would cancel every
+        // PermissionRequest milliseconds after it arrived (before the user could click).
+        // req.on('aborted') catches abrupt client aborts; res.on('close') catches the socket
+        // closing while we still have an unsent response — those are the real disconnect signals.
         const onDisconnect = () => {
           if (!settled) {
             settled = true;
             try { this.sessionManager.cancelPendingByRespond(respond); } catch {}
           }
         };
-        req.on('close', onDisconnect);
         req.on('aborted', onDisconnect);
-        res.on('close', onDisconnect);
+        res.on('close', () => { if (!res.writableEnded) onDisconnect(); });
       } else {
         this.sessionManager.handleEvent(event, null);
         try {
