@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow, ipcMain, screen, Tray, Menu, nativeImage, globalShortcut, shell, systemPreferences } = require('electron');
+const { app, BrowserWindow, ipcMain, screen, Tray, Menu, nativeImage, globalShortcut, shell, systemPreferences, powerMonitor } = require('electron');
 const path = require('path');
 const SessionManager = require('./sessionManager');
 const HookServer = require('./hookServer');
@@ -14,12 +14,18 @@ const { getAllAgents, getEnabledAgents } = require('./agents');
 const { getAllSounds, listPacks } = require('./soundGenerator');
 const updateChecker = require('./updateChecker');
 const { debugLog } = require('./debugLog');
+const AttentionPolicy = require('./attentionPolicy');
+const ForegroundWatcher = require('./foregroundWatcher');
 
 let mainWindow = null;
 let tray = null;
 let sessionManager = null;
 let hookServer = null;
 let sessionScanner = null;
+let policy = null;
+let fgWatcher = null;
+let shortcutConflicts = [];
+const OWN_PIDS = new Set([process.pid]);
 
 // Window size = expanded dimensions + shadow padding. Visual changes are driven by
 // CSS animations on the island element so we never call setBounds at runtime; that
@@ -54,6 +60,16 @@ app.whenReady().then(async () => {
   try {
     if (hookInstaller.isInstalled()) hookInstaller.deployBridge();
   } catch {}
+  // Installed hooks predating a newly handled event (e.g. StopFailure) get it added; only our entries change.
+  try {
+    if (hookInstaller.isInstalled()) {
+      const h = hookInstaller.getHookHealth();
+      if (h.missing.length || h.stale.length) {
+        hookInstaller.installHooks();
+        debugLog('hooks', `repaired missing=${h.missing.join(',') || '-'} stale=${h.stale.join(',') || '-'}`);
+      }
+    }
+  } catch {}
 
   sessionManager = new SessionManager();
   hookServer = new HookServer(sessionManager);
@@ -80,26 +96,62 @@ app.whenReady().then(async () => {
   sessionScanner.start((scanned) => {
     sessionManager.updateScannedSessions(scanned);
     setProcMap(sessionScanner.procMap);
+    sessionManager.reapOrphans(sessionScanner.procMap, sessionScanner._procGen || 0);
   });
+
+  policy = new AttentionPolicy({ config, getIdleSeconds: () => powerMonitor.getSystemIdleTime() });
+  policy.start();
+  try {
+    powerMonitor.on('lock-screen', () => policy.setAway(true, 'lock'));
+    powerMonitor.on('unlock-screen', () => policy.setAway(false));
+    powerMonitor.on('suspend', () => policy.setAway(true, 'suspend'));
+    powerMonitor.on('resume', () => policy.setAway(false));
+  } catch {}
+  policy.on('seen', (sessionId) => sessionManager.markSeen(sessionId));
+  policy.on('change', (st) => sendToRenderer('focus-state', st));
+  policy.on('quiet-ended', ({ since }) => sendQuietSummary(since));
+
+  fgWatcher = new ForegroundWatcher();
+  fgWatcher.on('change', (fg) => {
+    policy.setForeground(fg, sessionManager.getState().sessions, sessionScanner.procMap, OWN_PIDS);
+  });
+  fgWatcher.start();
+  sessionManager.setPresenceProbe((sid) => policy.presenceAt(sid, !!(fgWatcher && fgWatcher.current)));
 
   sessionManager.on('state-changed', () => {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('state-changed', sessionManager.getState());
-    }
+    const state = sessionManager.getState();
+    // Session names can arrive after the window title did, so the foreground match is re-checked here.
+    if (fgWatcher && fgWatcher.current) policy.setForeground(fgWatcher.current, state.sessions, sessionScanner.procMap, OWN_PIDS);
+    sendToRenderer('state-changed', state);
+    scheduleTrayUpdate(state);
   });
 
-  // Forward completion events to the renderer.
-  // When suppressNotifications=true we skip the UI card entirely.
+  // Ordinary completions are recorded in the inbox; only the policy decides whether one may interrupt.
   sessionManager.on('completion', (payload) => {
-    if (config.get('suppressNotifications') === true) return;
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('completion-notify', payload);
-    }
+    const looking = policy.isLookingAt(payload.sessionId);
+    if (looking) sessionManager.markSeen(payload.sessionId, payload.version);
+    const rec = sessionManager.attention.get(payload.sessionId);
+    const alertNext = !!(rec && rec.alertNext);
+    if (!policy.shouldExpandCompletion({ turnMs: payload.turnMs, looking, alertNext })) return;
+    // Consumed only once it is actually shown; a suppressed one stays armed for the next finish.
+    if (alertNext) sessionManager.attention.consumeAlertNext(payload.sessionId);
+    const sound = alertNext || config.get('completionAlert') === 'always';
+    sendToRenderer('completion-notify', { ...payload, kind: 'completion', alertNext, sound });
+  });
+
+  sessionManager.on('attention', ({ sessionId, kind, reason }) => {
+    if (policy.isQuiet()) return;
+    const rec = sessionManager.attention.get(sessionId) || {};
+    sendToRenderer('completion-notify', {
+      kind, reason, sessionId,
+      projectName: rec.name || '', gitBranch: rec.gitBranch || '', cwd: rec.cwd || '', agent: rec.agent || 'claude',
+      lastResponse: rec.text || '', timestamp: Date.now(), sound: true
+    });
   });
 
   // Forward sound events to the renderer
   sessionManager.on('sound', (type, meta) => {
-    if (!config.get('soundEnabled')) return;
+    if (!config.get('soundEnabled') || (policy && policy.isQuiet())) return;
     const keyMap = {
       sessionStart: 'soundOnSessionStart',
       toolUse: 'soundOnToolUse',
@@ -124,7 +176,7 @@ app.whenReady().then(async () => {
       }
     }
     if (keys.has('language')) rebuildTrayMenu();
-    if (keys.has('shortcutToggle')) registerShortcuts();
+    if (keys.has('shortcutToggle') || keys.has('shortcutNext')) registerShortcuts();
     if (keys.has('panelWidth') || keys.has('panelHeight') || keys.has('displayId') || keys.has('panelOffsetX')) {
       repositionWindow();
     }
@@ -276,19 +328,42 @@ function getTargetDisplay() {
 }
 
 function createTray() {
-  // Prefer the packaged build/icon.png; fall back to a runtime-generated icon in dev.
-  const fs = require('fs');
-  const iconPath = path.join(__dirname, '..', '..', 'build', 'icon.png');
-  let icon;
-  if (fs.existsSync(iconPath)) {
-    icon = nativeImage.createFromPath(iconPath);
-  } else {
-    icon = nativeImage.createFromBuffer(createTrayIconBuffer(), { width: 32, height: 32 });
-  }
-  tray = new Tray(icon);
+  tray = new Tray(trayIcon('idle'));
   tray.setToolTip('CodePeek');
   rebuildTrayMenu();
   tray.on('click', () => revealWindow('tray'));
+}
+
+const TRAY_DOTS = { idle: [0x8E, 0x8E, 0x93], running: [0x30, 0xD1, 0x58], reply: [0x6A, 0xB0, 0xFF], waiting: [0xF5, 0xB8, 0x4C] };
+const trayIconCache = new Map();
+function trayIcon(kind) {
+  if (!trayIconCache.has(kind)) {
+    trayIconCache.set(kind, nativeImage.createFromBuffer(createTrayIconBuffer(TRAY_DOTS[kind] || TRAY_DOTS.idle), { width: 32, height: 32 }));
+  }
+  return trayIconCache.get(kind);
+}
+
+// The dot shows the most urgent thing: waiting on you > new replies > running > idle.
+let trayTimer = null;
+let trayKind = '';
+function scheduleTrayUpdate(state) {
+  if (trayTimer) return;
+  trayTimer = setTimeout(() => {
+    trayTimer = null;
+    if (!tray) return;
+    const dict = getDict(config.get('language'));
+    const att = state.attention || [];
+    const waiting = state.pendingPermissions.length + state.pendingQuestions.length + att.filter(a => a.kind !== 'reply').length;
+    const replies = att.filter(a => a.kind === 'reply').length;
+    const running = state.sessions.filter(s => s.isRunning !== false && ['thinking', 'tool_use', 'subagent', 'compacting'].includes(s.status)).length;
+    const kind = waiting ? 'waiting' : replies ? 'reply' : running ? 'running' : 'idle';
+    if (kind !== trayKind) { trayKind = kind; tray.setImage(trayIcon(kind)); }
+    const parts = [];
+    if (waiting) parts.push(`${waiting} ${dict.inboxAnswer || 'waiting'}`);
+    if (replies) parts.push(`${replies} ${dict.inboxReplies || 'new replies'}`);
+    if (running) parts.push(`${running} ${dict.statsRunning || 'running'}`);
+    tray.setToolTip(['CodePeek', ...parts].join(' · '));
+  }, 400);
 }
 
 function rebuildTrayMenu() {
@@ -296,6 +371,7 @@ function rebuildTrayMenu() {
   const dict = getDict(config.get('language'));
   const menu = Menu.buildFromTemplate([
     { label: dict.menuShow || 'Show', click: () => revealWindow('tray-menu') },
+    { label: dict.menuHide || 'Hide', click: () => { if (mainWindow) mainWindow.hide(); } },
     { type: 'separator' },
     { label: dict.btnInstall, click: () => { try { hookInstaller.installHooks(); } catch {} } },
     { label: dict.btnUninstall, click: () => { try { hookInstaller.uninstallHooks(); } catch {} } },
@@ -305,9 +381,8 @@ function rebuildTrayMenu() {
   tray.setContextMenu(menu);
 }
 
-// CodePeek tray icon: 32x32 rounded capsule (Dynamic Island silhouette) with a green pulse in the center.
-// Drawing at 32 and letting Electron downsample to 16 looks sharper than drawing directly at 16 on hi-DPI displays.
-function createTrayIconBuffer() {
+// 32x32 capsule with a status dot; drawn at 32 because Electron's downsample to 16 is sharper on hi-DPI screens.
+function createTrayIconBuffer(dotColor) {
   const W = 32, H = 32;
   // Capsule: 26w x 14h, vertically centered, radius = h/2.
   const capsuleW = 26, capsuleH = 14;
@@ -315,8 +390,7 @@ function createTrayIconBuffer() {
   const radius = capsuleH / 2;
   // Capsule background: deep space gray; good contrast against the Win11 taskbar.
   const BG = [0x1C, 0x1C, 0x1E];
-  // Center pulse: CodePeek brand green.
-  const DOT = [0x30, 0xD1, 0x58];
+  const DOT = dotColor || [0x30, 0xD1, 0x58];
 
   const pixels = Buffer.alloc(W * H * 4);
   const setPixel = (x, y, r, g, b, a) => {
@@ -564,6 +638,40 @@ function registerIPC() {
     return repositionWindow((Number(config.get('panelOffsetX')) || 0) + Math.round(n));
   });
 
+  secureHandle('mark-seen', (_, sessionId, version) => {
+    if (typeof sessionId !== 'string') return;
+    sessionManager.markSeen(sessionId, Number.isFinite(version) ? version : undefined);
+  });
+
+  secureHandle('set-alert-next', (_, sessionId, on) => {
+    if (typeof sessionId !== 'string') return;
+    sessionManager.setAlertNext(sessionId, !!on);
+  });
+
+  secureHandle('set-dnd', (_, minutes) => {
+    const m = Number(minutes);
+    if (![-1, 0, 30, 60, 120].includes(m)) return policy.focusState();
+    policy.setDnd(m);
+    return policy.focusState();
+  });
+
+  secureHandle('get-focus-state', () => policy.focusState());
+
+  secureHandle('get-health', () => ({
+    hooks: hookInstaller.getHookHealth(),
+    codexInstalled: hookInstaller.isCodexInstalled(),
+    serverListening: !!(hookServer && hookServer.server && hookServer.server.listening),
+    port: hookServer ? hookServer.port : null,
+    lastEventAt: sessionManager.lastEventAt || 0,
+    foregroundWatcher: !!(fgWatcher && fgWatcher.current),
+    shortcutConflicts
+  }));
+
+  secureHandle('repair-hooks', () => {
+    try { hookInstaller.installHooks(); return { success: true, hooks: hookInstaller.getHookHealth() }; }
+    catch (err) { return { success: false, error: err.message }; }
+  });
+
   secureHandle('focus-window', () => {
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.focus();
   });
@@ -655,23 +763,55 @@ function getAccentColor() {
   return null;
 }
 
+// register() returns false when another app owns the accelerator; those are reported in the health panel.
 function registerShortcuts() {
-  try {
-    globalShortcut.unregisterAll();
-    const toggle = config.get('shortcutToggle');
-    if (toggle) {
-      globalShortcut.register(toggle, () => {
-        if (!mainWindow) return;
-        if (mainWindow.isVisible()) mainWindow.hide();
-        else revealWindow('shortcut');
+  try { globalShortcut.unregisterAll(); } catch {}
+  const failed = [];
+  const reg = (accel, action) => {
+    if (!accel) return;
+    try {
+      const ok = globalShortcut.register(accel, () => {
+        revealWindow('shortcut');
+        if (mainWindow && !mainWindow.isDestroyed()) mainWindow.focus();
+        sendToRenderer('shortcut', action);
       });
-    }
-  } catch {}
+      if (!ok) failed.push(accel);
+    } catch { failed.push(accel); }
+  };
+  reg(config.get('shortcutToggle'), 'toggle');
+  reg(config.get('shortcutNext'), 'next');
+  shortcutConflicts = failed;
+  if (failed.length) debugLog('shortcut', `register failed: ${failed.join(', ')}`);
+}
+
+function sendToRenderer(channel, payload) {
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(channel, payload);
+}
+
+// After away / do-not-disturb ends, one card sums up what piled up instead of replaying every alert.
+function sendQuietSummary(since) {
+  const st = sessionManager.getState();
+  const att = st.attention || [];
+  const summary = {
+    kind: 'summary',
+    since,
+    questions: st.pendingPermissions.length + st.pendingQuestions.length,
+    replies: att.filter(a => a.kind === 'reply' && a.since >= since).length,
+    inputs: att.filter(a => a.kind === 'input').length,
+    blocked: att.filter(a => a.kind === 'blocked').length,
+    timestamp: Date.now()
+  };
+  if (summary.questions + summary.replies + summary.inputs + summary.blocked === 0) return;
+  // New replies alone are not worth a sound; things waiting on the user are.
+  summary.sound = summary.questions + summary.inputs + summary.blocked > 0;
+  sendToRenderer('completion-notify', summary);
 }
 
 app.on('before-quit', () => {
   app.isQuitting = true;
   try { globalShortcut.unregisterAll(); } catch {}
+  if (fgWatcher) fgWatcher.stop();
+  if (policy) policy.stop();
   if (sessionScanner) sessionScanner.stop();
   if (sessionManager) sessionManager.destroy();
   if (hookServer) hookServer.stop();

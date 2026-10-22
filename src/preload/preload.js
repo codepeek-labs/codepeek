@@ -19,6 +19,12 @@ contextBridge.exposeInMainWorld('codePeek', {
     ipcRenderer.invoke('approve-permission', requestId, behavior, answers, message),
   answerQuestion: (requestId, answer) =>
     ipcRenderer.invoke('answer-question', requestId, answer),
+  markSeen: (sessionId, version) => ipcRenderer.invoke('mark-seen', sessionId, version),
+  setAlertNext: (sessionId, on) => ipcRenderer.invoke('set-alert-next', sessionId, on),
+  setDnd: (minutes) => ipcRenderer.invoke('set-dnd', minutes),
+  getFocusState: () => ipcRenderer.invoke('get-focus-state'),
+  getHealth: () => ipcRenderer.invoke('get-health'),
+  repairHooks: () => ipcRenderer.invoke('repair-hooks'),
 
   // Hooks - Claude
   installHooks: () => ipcRenderer.invoke('install-hooks'),
@@ -78,6 +84,16 @@ contextBridge.exposeInMainWorld('codePeek', {
     const h = (_, data) => cb(data);
     ipcRenderer.on('notification', h);
     return () => ipcRenderer.removeListener('notification', h);
+  },
+  onShortcut: (cb) => {
+    const h = (_, action) => cb(action);
+    ipcRenderer.on('shortcut', h);
+    return () => ipcRenderer.removeListener('shortcut', h);
+  },
+  onFocusState: (cb) => {
+    const h = (_, st) => cb(st);
+    ipcRenderer.on('focus-state', h);
+    return () => ipcRenderer.removeListener('focus-state', h);
   },
   onAccentChanged: (cb) => {
     const h = (_, color) => cb(color);

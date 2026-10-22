@@ -21,7 +21,12 @@ const DEFAULT_CONFIG = {
   hoverExpand: true,
   hoverCollapseDelay: 1500,    // ms to wait after mouse leaves before auto-collapsing (0 = immediate)
   hoverExpandDelay: 80,        // ms of hover before auto-expanding
-  suppressNotifications: false, // true = never show completion card; default is to show
+  suppressNotifications: false, // legacy: true forces the quiet completion mode
+  completionAlert: 'quiet',    // quiet (inbox only) | smart (not watching and turn >= shortTurnSeconds) | always
+  shortTurnSeconds: 20,
+  awayIdleSeconds: 120,        // no input for this long counts as away: no auto-expand, no sounds
+  dndUntil: 0,                 // 0 = off, -1 = until turned off, otherwise epoch ms
+  dndSince: 0,                 // when the current DND began, so a restart still summarises from there
   completionDisplayTime: 5,    // seconds the completion card stays visible (1-30)
   cleanupStaleAfter: 300,      // seconds; 0 = never clean up
 
@@ -44,7 +49,7 @@ const DEFAULT_CONFIG = {
   soundEnabled: true,
   soundPack: 'soft',          // soft | chime | 8bit | minimal | silent
   soundVolume: 0.5,
-  soundOnSessionStart: true,
+  soundOnSessionStart: false,
   soundOnToolUse: false,
   soundOnPermission: true,
   soundOnQuestion: true,
@@ -57,10 +62,11 @@ const DEFAULT_CONFIG = {
 
   // Shortcuts
   shortcutToggle: 'Control+Shift+I',
+  shortcutNext: 'Control+Shift+J',
   shortcutApprove: 'Control+Y',
   shortcutDeny: 'Control+N',
 
-  configVersion: 2,
+  configVersion: 3,
 
   // Agents (supported tools enabled/disabled)
   agents: {
@@ -100,10 +106,16 @@ class Config extends EventEmitter {
 
   // v1 files stored every default verbatim, so the old defaults are treated as "never customized".
   _migrate(loaded) {
-    if (!loaded || typeof loaded !== 'object' || (loaded.configVersion || 1) >= 2) return false;
-    if (loaded.panelWidth === 420) loaded.panelWidth = 600;
-    if (loaded.sessionGrouping === 'all') loaded.sessionGrouping = 'status';
-    loaded.configVersion = 2;
+    if (!loaded || typeof loaded !== 'object') return false;
+    const from = loaded.configVersion || 1;
+    if (from >= 3) return false;
+    if (from < 2) {
+      if (loaded.panelWidth === 420) loaded.panelWidth = 600;
+      if (loaded.sessionGrouping === 'all') loaded.sessionGrouping = 'status';
+    }
+    // v3: a chime on every prompt (~57/day) contradicts the quiet default; it can be turned back on.
+    if (loaded.soundOnSessionStart === true) loaded.soundOnSessionStart = false;
+    loaded.configVersion = 3;
     return true;
   }
 

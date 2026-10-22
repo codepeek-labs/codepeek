@@ -6,6 +6,7 @@ const config = require('./config');
 const { detectAgentFromEvent } = require('./agents');
 const { normalizeEvent } = require('./eventNormalizer');
 const TranscriptWatcher = require('./transcriptWatcher');
+const AttentionStore = require('./attentionStore');
 const { debugLog } = require('./debugLog');
 
 // Stale-session cleanup timeout (configurable).
@@ -14,8 +15,11 @@ function getSessionTimeout() {
   return (s || 300) * 1000;
 }
 
-const PENDING_TTL = 10 * 60 * 1000;
+const QUESTION_TTL = 10 * 60 * 1000;
 const RESOLVED_KEEP_MS = 3000;
+const MAX_REPLY = 20000;
+// Claude Notification types that mean "go to the terminal": nothing CodePeek can answer itself.
+const NEEDS_INPUT_TYPES = new Set(['agent_needs_input', 'elicitation_dialog', 'elicitation_url_dialog']);
 const MAX_CALLS_PER_SESSION = 200;
 const MAX_TEXT = 8000;
 const MAX_ANSWER = 4000;
@@ -142,6 +146,13 @@ class SessionManager extends EventEmitter {
     this._calls = new Map(); // sessionId -> Map(tool_use_id -> { actor, toolName, inputKey, boundTo, ts })
     this._recentlyResolved = [];
     this._lastCompletionTs = new Map();
+    this._turnStart = new Map();
+    this._orphanMisses = new Map();
+    this._lastProcRefresh = 0;
+    this.lastEventAt = 0;
+    this.attention = opts.attentionStore || new AttentionStore();
+    // (sessionId) => true | false | null: is the user at that session's terminal right now (null = unknown).
+    this._presenceProbe = opts.presenceProbe || (() => null);
     this._transcripts = opts.transcriptWatcher
       || new TranscriptWatcher((key, toolUseId, m) => this._onTranscriptResult(key, toolUseId, m));
     this._cleanupTimer = setInterval(() => this._cleanupStaleSessions(), 15000);
@@ -155,6 +166,7 @@ class SessionManager extends EventEmitter {
 
     if (!sessionId) { if (respond) respond(null); return; }
 
+    this.lastEventAt = Date.now();
     this._touchSession(sessionId, event);
 
     switch (eventName) {
@@ -166,11 +178,12 @@ class SessionManager extends EventEmitter {
         break;
       case 'UserPromptSubmit':
         this._settleMainTurn(sessionId, event, 'new-prompt');
-        this._onUserPrompt(sessionId);
+        this._onUserPrompt(sessionId, event);
         this.emit('sound', 'sessionStart', { sessionId, agent: this.sessions.get(sessionId)?.agent });
         break;
       case 'PreToolUse':
         this._trackCallStart(sessionId, event);
+        if (this.attention.clearFlag(sessionId, 'input', actorOf(event))) this.emit('state-changed');
         this._onPreToolUse(sessionId, event);
         this.emit('sound', 'toolUse', { sessionId, agent: this.sessions.get(sessionId)?.agent });
         break;
@@ -193,7 +206,11 @@ class SessionManager extends EventEmitter {
         return;
       case 'Stop':
         this._settleMainTurn(sessionId, event, 'turn-ended');
-        this._onStop(sessionId);
+        this._onStop(sessionId, event);
+        break;
+      case 'StopFailure':
+        this._settleMainTurn(sessionId, event, 'turn-ended');
+        this._onStopFailure(sessionId, event);
         break;
       case 'SubagentStart':
         this._onSubagentStart(sessionId, event);
@@ -300,8 +317,9 @@ class SessionManager extends EventEmitter {
           name: scanned.name || hs.name || '',
           model: scanned.model || hs.model || '',
           gitBranch: scanned.gitBranch || '',
-          lastPrompt: scanned.lastPrompt || hs.lastPrompt || '',
-          lastResponse: scanned.lastResponse || hs.lastResponse || '',
+          // Hook text is exact for the finished turn; the transcript tail is fresher while a turn runs.
+          lastPrompt: hs.lastPrompt || scanned.lastPrompt || '',
+          lastResponse: (hs.status === 'idle' && typeof hs.lastResponse === 'string') ? hs.lastResponse : (scanned.lastResponse || hs.lastResponse || ''),
           timeAgo: this._formatTimeAgo(Math.max(hs.lastActivity || 0, scanned.lastActivityAt || 0)),
           // Scanner pid is the real CLI; bridge_ppid may be a shell wrapper that has already exited.
           pid: scanned.pid || hs.pid,
@@ -341,7 +359,50 @@ class SessionManager extends EventEmitter {
       pendingQuestions: Array.from(this.pendingQuestions.entries()).map(([id, q]) => ({
         id, sessionId: q.sessionId, question: q.question, timestamp: q.timestamp
       })),
-      recentlyResolved: this._recentlyResolved.slice()
+      recentlyResolved: this._recentlyResolved.slice(),
+      attention: this.attention.list(),
+      alertNext: this.attention.alertNextIds(),
+      lastEventAt: this.lastEventAt
+    };
+  }
+
+  setPresenceProbe(fn) { this._presenceProbe = typeof fn === 'function' ? fn : () => null; }
+
+  markSeen(sessionId, version) {
+    if (this.attention.markSeen(sessionId, version)) this.emit('state-changed');
+  }
+
+  setAlertNext(sessionId, on) {
+    const s = this.sessions.get(sessionId) || (this.scannedSessions || []).find(x => x.id === sessionId) || {};
+    this.attention.setAlertNext(sessionId, on, this._metaOf(sessionId, s));
+    this.emit('state-changed');
+  }
+
+  // A pending request whose CLI process is gone across two process-table refreshes can never be answered.
+  reapOrphans(procMap, generation) {
+    if (!(procMap instanceof Map) || procMap.size === 0 || !generation || generation === this._lastProcRefresh) return;
+    this._lastProcRefresh = generation;
+    for (const [id, p] of Array.from(this.pendingPermissions)) {
+      const scanned = (this.scannedSessions || []).find(x => x.id === p.sessionId);
+      const pid = (scanned && scanned.pid) || 0;
+      if (!pid || procMap.has(pid)) { this._orphanMisses.delete(id); continue; }
+      const misses = (this._orphanMisses.get(id) || 0) + 1;
+      this._orphanMisses.set(id, misses);
+      if (misses >= 2) {
+        this._orphanMisses.delete(id);
+        this._settlePending(id, { response: DENY, outcome: 'ended', reason: 'process-gone' });
+      }
+    }
+  }
+
+  _metaOf(sessionId, s) {
+    const scanned = (this.scannedSessions || []).find(x => x.id === sessionId) || {};
+    const cwd = (s && s.cwd) || scanned.cwd || '';
+    return {
+      agent: (s && s.agent) || scanned.agent || 'claude',
+      name: scanned.name || (s && s.name) || scanned.projectName || (cwd ? cwd.split(/[\\/]/).filter(Boolean).pop() : ''),
+      cwd,
+      gitBranch: scanned.gitBranch || ''
     };
   }
 
@@ -355,6 +416,7 @@ class SessionManager extends EventEmitter {
     }
     this.pendingQuestions.clear();
     this._transcripts.stop();
+    this.attention.flush();
   }
 
   // ========== Pending lifecycle ==========
@@ -508,6 +570,8 @@ class SessionManager extends EventEmitter {
       }
     }
     this._dropSession(sessionId);
+    // The user exited the CLI on purpose; nothing in it is waiting for them any more.
+    this.attention.remove(sessionId);
     this.emit('state-changed');
   }
 
@@ -515,15 +579,26 @@ class SessionManager extends EventEmitter {
     this.sessions.delete(sessionId);
     this._calls.delete(sessionId);
     this._lastCompletionTs.delete(sessionId);
+    this._turnStart.delete(sessionId);
   }
 
-  _onUserPrompt(sessionId) {
+  _onUserPrompt(sessionId, event) {
     const session = this.sessions.get(sessionId);
     if (session) {
       if (!this._isWaiting(sessionId)) session.status = 'thinking';
       session.currentTool = null;
       session.toolInput = null;
+      if (typeof event.prompt === 'string' && event.prompt.trim()) session.lastPrompt = event.prompt.substring(0, 2000);
     }
+    this._turnStart.set(sessionId, Date.now());
+    // A new turn's Stop must not be merged into the previous turn's duplicate-Stop window.
+    this._lastCompletionTs.delete(sessionId);
+    // Turns Claude starts on its own (loops, background reports) also fire this hook; they must not mark a reply read.
+    const rec = this.attention.get(sessionId);
+    let present = null;
+    try { present = this._presenceProbe(sessionId); } catch {}
+    if (rec && rec.kind === 'reply' && present !== true) this.attention.clearFlags(sessionId);
+    else this.attention.clear(sessionId);
     this.emit('state-changed');
   }
 
@@ -600,6 +675,7 @@ class SessionManager extends EventEmitter {
     // Claude's Notification hook only carries idle pings; real questions arrive as AskUserQuestion permissions.
     if (event._source === 'claude') {
       if (respond) respond('{}');
+      this._onClaudeNotification(sessionId, event, question);
       return;
     }
     if (!question) {
@@ -615,12 +691,58 @@ class SessionManager extends EventEmitter {
     this.emit('state-changed');
   }
 
-  _onStop(sessionId) {
-    this._updateSessionStatus(sessionId, 'idle');
-    this._emitCompletion(sessionId);
+  // Claude notifications are informational; only "go to the terminal" kinds become inbox entries.
+  _onClaudeNotification(sessionId, event, message) {
+    const type = String(event.notification_type || '');
+    const meta = this._metaOf(sessionId, this.sessions.get(sessionId));
+    const actor = actorOf(event);
+    let flagged = false;
+    if (type === 'idle_prompt') {
+      const s = this.sessions.get(sessionId);
+      if (s) s.idlePromptAt = Date.now();
+    } else if (type === 'permission_prompt') {
+      // Fires when the terminal prompt waited ~6s; our own card already covers requests we hold.
+      const held = Array.from(this.pendingPermissions.values()).some(p => p.sessionId === sessionId);
+      if (!held) { this.attention.flag(sessionId, meta, 'input', type, message, actor); flagged = true; }
+    } else if (NEEDS_INPUT_TYPES.has(type)) {
+      this.attention.flag(sessionId, meta, 'input', type, message, actor);
+      flagged = true;
+    } else if (type === 'elicitation_complete' || type === 'elicitation_response') {
+      if (this.attention.clearFlag(sessionId, 'input', actor)) this.emit('state-changed');
+    }
+    if (flagged) {
+      this.emit('attention', { sessionId, kind: 'input', reason: type });
+      this.emit('state-changed');
+    }
   }
 
-  _emitCompletion(sessionId) {
+  _onStop(sessionId, event) {
+    const session = this.sessions.get(sessionId);
+    const hasText = typeof event.last_assistant_message === 'string';
+    const text = hasText ? event.last_assistant_message.substring(0, MAX_REPLY) : undefined;
+    if (session && hasText) {
+      session.lastResponse = text;
+      session.lastResponseAt = Date.now();
+    }
+    // background_tasks distinguishes "paused waiting for background work" from "done".
+    const background = Array.isArray(event.background_tasks) ? event.background_tasks.length : 0;
+    if (background > 0) {
+      this._updateSessionStatus(sessionId, 'background', String(background));
+      return;
+    }
+    this._updateSessionStatus(sessionId, 'idle');
+    this._emitCompletion(sessionId, text);
+  }
+
+  _onStopFailure(sessionId, event) {
+    const reason = String(event.error || 'error');
+    const detail = [event.error_details, event.last_assistant_message, event.error_message].find(v => typeof v === 'string' && v) || '';
+    this.attention.flag(sessionId, this._metaOf(sessionId, this.sessions.get(sessionId)), 'blocked', reason, detail, actorOf(event));
+    this._updateSessionStatus(sessionId, 'blocked', reason);
+    this.emit('attention', { sessionId, kind: 'blocked', reason });
+  }
+
+  _emitCompletion(sessionId, text) {
     // Merge duplicate Stop events within 1 second for the same session (e.g. cascading SubagentStop events).
     const now = Date.now();
     const last = this._lastCompletionTs.get(sessionId) || 0;
@@ -630,10 +752,14 @@ class SessionManager extends EventEmitter {
     const session = this.sessions.get(sessionId) || {};
     const scanned = (this.scannedSessions || []).find(s => s.id === sessionId) || {};
     const cwd = session.cwd || scanned.cwd || '';
+    const reply = text !== undefined ? text : (session.lastResponse || '');
+    // Always recorded: the cwd heuristic below may only silence the alert, never drop an independent reply.
+    const record = this.attention.reply(sessionId, this._metaOf(sessionId, session), reply);
+    this.emit('state-changed');
 
     // Codex in the same cwd as an active Claude session is usually Claude's /codex helper, so it stays quiet.
     const detectedAgent = session.agent || scanned.agent;
-    if (detectedAgent === 'codex' && cwd) {
+    if (detectedAgent === 'codex' && cwd && !record.alertNext) {
       const CLAUDE_ACTIVE_WINDOW_MS = 2 * 60 * 1000;
       for (const [, s] of this.sessions) {
         if (s.id !== sessionId && s.agent === 'claude' && s.cwd === cwd
@@ -644,13 +770,16 @@ class SessionManager extends EventEmitter {
       }
     }
     const projectName = scanned.projectName || (cwd ? cwd.split(/[\\/]/).filter(Boolean).pop() : '') || '';
+    const started = this._turnStart.get(sessionId) || 0;
     this.emit('completion', {
       sessionId,
       projectName,
       sessionTitle: scanned.name || session.name || '',
       gitBranch: scanned.gitBranch || '',
       cwd,
-      lastResponse: scanned.lastResponse || session.lastResponse || '',
+      lastResponse: reply,
+      version: record.version,
+      turnMs: started ? now - started : null,
       agent: session.agent || scanned.agent || 'claude',
       timestamp: now
     });
@@ -757,16 +886,9 @@ class SessionManager extends EventEmitter {
         this._dropSession(id);
       }
     }
-    // bridge.js can block for 24h; an unanswered card after 10 minutes is almost certainly orphaned.
-    for (const [id, p] of Array.from(this.pendingPermissions)) {
-      if (p.timestamp && now - p.timestamp > PENDING_TTL) {
-        const response = JSON.stringify({ hookSpecificOutput: { hookEventName: 'PermissionRequest',
-          decision: { behavior: 'deny', message: 'CodePeek: no answer within 10 minutes.' } } });
-        this._settlePending(id, { response, outcome: 'expired', reason: 'ttl' });
-      }
-    }
+    // Permission requests never expire by age; only disconnect, session end, process death or an outside answer settle them.
     for (const [id, q] of this.pendingQuestions) {
-      if (q.timestamp && now - q.timestamp > PENDING_TTL) {
+      if (q.timestamp && now - q.timestamp > QUESTION_TTL) {
         try { q.respond('{}'); } catch {}
         this.pendingQuestions.delete(id);
       }

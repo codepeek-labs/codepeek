@@ -20,7 +20,8 @@ const HOOK_EVENTS = {
   SessionStart: { timeout: 5 },
   SessionEnd: { timeout: 5 },
   Notification: { timeout: 86400 },
-  PreCompact: { timeout: 5 }
+  PreCompact: { timeout: 5 },
+  StopFailure: { timeout: 5 }
 };
 
 function getClaudeSettingsPath() {
@@ -260,8 +261,11 @@ function installHooks() {
       if (!existing) {
         settings.hooks[eventName].push(hookEntry);
       } else {
-        // Update the existing entry.
-        existing.hooks = hookEntry.hooks;
+        // Replace only our own handler; other tools' handlers in the same group must survive.
+        const at = existing.hooks.findIndex(isCodePeekHook);
+        const others = existing.hooks.filter(h => !isCodePeekHook(h));
+        others.splice(Math.max(0, at), 0, ...hookEntry.hooks);
+        existing.hooks = others;
       }
     }
   }
@@ -292,6 +296,29 @@ function uninstallHooks() {
 
   writeSettings(settings);
   return true;
+}
+
+// Per-event view of our own entries, used by the settings health panel and the startup repair.
+function getHookHealth() {
+  const report = { installed: false, missing: [], stale: [], bridgeDeployed: false, bridgeCurrent: false, error: null };
+  try {
+    const bundled = fs.readFileSync(path.join(__dirname, '..', 'bridge', 'bridge.js'), 'utf8');
+    const deployed = fs.existsSync(getBridgePath()) ? fs.readFileSync(getBridgePath(), 'utf8') : null;
+    report.bridgeDeployed = deployed !== null;
+    report.bridgeCurrent = deployed === bundled;
+  } catch {}
+  let settings;
+  try { settings = readSettings(); }
+  catch (err) { report.error = err.message; return report; }
+  const hooks = settings.hooks || {};
+  const command = getBridgeCommand('claude');
+  for (const [eventName, cfg] of Object.entries(HOOK_EVENTS)) {
+    const entries = (hooks[eventName] || []).flatMap(h => (h && h.hooks) || []).filter(isCodePeekHook);
+    if (entries.length === 0) { report.missing.push(eventName); continue; }
+    report.installed = true;
+    if (!entries.some(e => e.command === command && e.timeout === cfg.timeout)) report.stale.push(eventName);
+  }
+  return report;
 }
 
 function isInstalled() {
@@ -368,6 +395,8 @@ if (require.main === module) {
 }
 
 module.exports = {
+  getHookHealth,
+  HOOK_EVENTS,
   installHooks,
   uninstallHooks,
   isInstalled,

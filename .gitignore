@@ -28,3 +28,6 @@ start.cmd
 # Local user data (not for repo)
 .codepeek/
 *.local.json
+
+# Local planning docs, reviews and mockups (kept out of the repo)
+doc/plan/

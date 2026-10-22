@@ -10,7 +10,7 @@
   <div class="island" id="island">
     <!-- Collapsed indicator: strip or pill -->
     <div class="indicator" id="indicator">
-      <div class="strip-hit" id="stripHit"><div class="strip" id="strip"></div></div>
+      <div class="strip-hit" id="stripHit"><div class="strip" id="strip"></div><span class="strip-count" id="stripCount"></span></div>
       <div class="pill" id="pill">
         <span class="pill-mascot" id="pillMascot"></span>
         <span class="pill-text" id="pillText"></span>
@@ -34,6 +34,7 @@
         </div>
         <button class="hdr-back" id="btnBack"><span class="ico">&#xE72B;</span><span data-i18n="menuSettings">Settings</span></button>
         <div class="sp"></div>
+        <button class="ibtn" id="btnDnd"><span class="ico">&#xE708;</span></button>
         <button class="ibtn" id="btnMute"><span class="ico" id="icoMute">&#xE767;</span></button>
         <button class="ibtn" id="btnPin"><span class="ico">&#xE718;</span></button>
         <button class="ibtn" id="btnSettings"><span class="ico">&#xE713;</span></button>
@@ -90,10 +91,22 @@
                     <div class="rng"><input type="range" id="rangeHoverCollapseDelay" min="0" max="10000" step="100"><span class="v" id="valHoverCollapseDelay"></span></div></div>
                   <div class="srow"><div class="lb" data-i18n="completionDisplayTime">Completion Card Display Time</div>
                     <div class="rng"><input type="range" id="rangeCompletionTime" min="1" max="30" step="1"><span class="v" id="valCompletionTime"></span></div></div>
-                  <div class="srow"><div class="lb" data-i18n="suppressNotif">Smart Notification Suppression</div>
-                    <label class="switch"><input type="checkbox" id="chkSuppressNotif"><span class="slider"></span></label></div>
+                  <div class="srow"><div class="lb"><span data-i18n="completionAlert">Completion alerts</span><small data-i18n="completionAlertHint"></small></div>
+                    <div class="mini-seg" id="segCompletionAlert">
+                      <span data-v="quiet" data-i18n="alertQuiet">Quiet</span><span data-v="smart" data-i18n="alertSmart">Smart</span><span data-v="always" data-i18n="alertAlways">Every turn</span>
+                    </div></div>
+                  <div class="srow"><div class="lb"><span data-i18n="shortTurn">Short turn</span><small data-i18n="shortTurnHint"></small></div>
+                    <div class="rng"><input type="range" id="rangeShortTurn" min="5" max="120" step="5"><span class="v" id="valShortTurn"></span></div></div>
+                  <div class="srow"><div class="lb"><span data-i18n="awayIdle">Away after</span><small data-i18n="awayIdleHint"></small></div>
+                    <div class="rng"><input type="range" id="rangeAwayIdle" min="1" max="15" step="1"><span class="v" id="valAwayIdle"></span></div></div>
                   <div class="srow"><div class="lb" data-i18n="cleanupStale">Clean Stale Sessions After</div>
                     <div class="rng"><input type="number" id="numCleanup" min="0" max="86400" step="60"><span class="v" data-i18n="seconds">seconds</span></div></div>
+                </div>
+                <div class="sh" data-i18n="secShortcuts">Shortcuts</div>
+                <div class="sgrp">
+                  <div class="srow"><div class="lb" data-i18n="shortcutToggleLabel">Expand / collapse</div><span class="kbd" id="valShortcutToggle"></span></div>
+                  <div class="srow"><div class="lb" data-i18n="shortcutNextLabel">Handle next</div><span class="kbd" id="valShortcutNext"></span></div>
+                  <div class="srow" id="rowShortcutConflict" style="display:none"><div class="lb" data-i18n="shortcutConflict">Taken by another app</div><span class="hstate bad" id="valShortcutConflict"></span></div>
                 </div>
                 <div class="sh" data-i18n="secAbout">About</div>
                 <div class="sgrp about">
@@ -174,6 +187,17 @@
                     <button class="btn line sm" id="btnToggleHooks">Install</button></div>
                   <div class="srow"><div class="lb"><span class="mono">Codex</span><small id="codexHookStatusText"></small></div>
                     <button class="btn line sm" id="btnToggleCodexHooks">Install</button></div>
+                </div>
+                <div class="sh" data-i18n="secHealth">Health</div>
+                <div class="sgrp">
+                  <div class="srow"><div class="lb" data-i18n="healthHooks">Claude hooks</div><span class="hstate" id="hHooks"></span></div>
+                  <div class="srow"><div class="lb" data-i18n="healthBridge">Bridge script</div><span class="hstate" id="hBridge"></span></div>
+                  <div class="srow"><div class="lb" data-i18n="healthServer">Event server</div><span class="hstate" id="hServer"></span></div>
+                  <div class="srow"><div class="lb" data-i18n="healthLastEvent">Last event</div><span class="hstate" id="hLastEvent"></span></div>
+                  <div class="srow"><div class="lb" data-i18n="healthForeground">Foreground detection</div><span class="hstate" id="hForeground"></span></div>
+                  <div class="srow"><div class="lb"></div><div class="inline">
+                    <button class="btn line sm" id="btnHealthCheck" data-i18n="healthCheck">Check</button>
+                    <button class="btn allow sm" id="btnHealthRepair" data-i18n="healthRepair" style="display:none">Repair</button></div></div>
                 </div>
                 <div class="sh" data-i18n="enabledAgents">Enabled Agents</div>
                 <div class="sgrp" id="agentList"></div>

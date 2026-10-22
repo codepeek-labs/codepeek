@@ -8,6 +8,7 @@ const content = $('content');
 const indicator = $('indicator');
 const stripHit = $('stripHit');
 const strip = $('strip');
+const stripCount = $('stripCount');
 const pill = $('pill');
 const pillMascot = $('pillMascot');
 const pillText = $('pillText');
@@ -20,6 +21,7 @@ const headerStats = $('headerStats');
 const groupTabs = $('groupTabs');
 const btnBack = $('btnBack');
 const btnMute = $('btnMute');
+const btnDnd = $('btnDnd');
 const btnPin = $('btnPin');
 const btnSettings = $('btnSettings');
 const btnCollapse = $('btnCollapse');
@@ -48,7 +50,7 @@ const EXIT_LOCAL_MS = 450;
 const EXIT_EXTERNAL_MS = 900;
 const TOOL_LINGER_MS = 2000;
 const COMPLETION_THROTTLE_MS = 5000;
-const INPUT_ACTIVE_MS = 2000;
+const DETAIL_SEEN_MS = 1000;
 
 // ========== State ==========
 let currentState = { sessions: [], pendingPermissions: [], pendingQuestions: [], recentlyResolved: [] };
@@ -87,8 +89,13 @@ const lastToolBySession = new Map();
 const foldedGroups = new Set(['ended']);
 
 let completion = null; // { data, timer }
-let completionBadge = 0;
 let lastCompletionShownAt = 0;
+// Presence from the main process: away / do-not-disturb / fullscreen suppress auto-expansion and sounds.
+let focusState = { suppress: false, dnd: false, away: false, fullscreen: false, foregroundSessionId: null };
+const openDetails = new Set();
+const detailTimers = new Map();
+// An alert-next completion that could not show yet (settings open / a request on screen) waits here.
+const deferredCompletions = new Map(); // sessionId -> latest data, shown one at a time in arrival order
 let lastKeyAt = 0;
 let mouseInIsland = false;
 let composing = false;
@@ -127,6 +134,7 @@ async function init() {
     window.codePeek.getAccentColor().catch(() => null),
     window.codePeek.isHooksInstalled().catch(() => true)
   ]);
+  try { focusState = await window.codePeek.getFocusState() || focusState; } catch {}
   currentState = normalizeState(currentState);
   for (const p of currentState.pendingPermissions) seenRequests.add(p.id);
   for (const q of currentState.pendingQuestions) seenRequests.add(q.id);
@@ -151,12 +159,14 @@ async function init() {
   window.codePeek.onCollapse(() => userCollapse('main'));
   window.codePeek.onCompletionNotify(data => handleCompletion(data));
   window.codePeek.onAccentChanged(color => { accentColor = color; applyAccent(); });
+  window.codePeek.onFocusState(st => { focusState = st || focusState; renderHeader(); reconcile(); });
+  window.codePeek.onShortcut(action => handleShortcut(action));
 
   const mq = window.matchMedia('(prefers-reduced-motion: reduce)');
   mq.addEventListener('change', applyMotionPreference);
 
   document.addEventListener('visibilitychange', () => {
-    if (document.hidden) MascotClock.pause(); else MascotClock.resume();
+    if (document.hidden) { MascotClock.pause(); cancelDetailTimers(); } else { MascotClock.resume(); rearmDetailTimers(); }
   });
   window.addEventListener('keydown', onKeyDown, true);
   document.addEventListener('compositionstart', () => { composing = true; }, true);
@@ -178,7 +188,10 @@ function normalizeState(s) {
     sessions: (s && s.sessions) || [],
     pendingPermissions: (s && s.pendingPermissions) || [],
     pendingQuestions: (s && s.pendingQuestions) || [],
-    recentlyResolved: (s && s.recentlyResolved) || []
+    recentlyResolved: (s && s.recentlyResolved) || [],
+    attention: (s && s.attention) || [],
+    alertNext: (s && s.alertNext) || [],
+    lastEventAt: (s && s.lastEventAt) || 0
   };
 }
 
@@ -194,7 +207,7 @@ function handleState(state) {
   for (const id of liveIds) {
     if (!seenRequests.has(id)) {
       seenRequests.add(id);
-      playSound(id.startsWith('q_') ? 'question' : 'permission');
+      if (!focusState.suppress) playSound(id.startsWith('q_') ? 'question' : 'permission');
     }
   }
   for (const id of Array.from(snoozed)) if (!liveIds.has(id)) snoozed.delete(id);
@@ -205,6 +218,12 @@ function handleState(state) {
 }
 
 function livePerms() { return currentState.pendingPermissions; }
+function attentionOf(sessionId) { return currentState.attention.find(a => a.sessionId === sessionId) || null; }
+function inboxCounts() {
+  const att = currentState.attention;
+  const waiting = liveRequests().length + att.filter(a => a.kind === 'input' || a.kind === 'blocked').length;
+  return { waiting, replies: att.filter(a => a.kind === 'reply').length };
+}
 function liveQuestions() { return currentState.pendingQuestions; }
 function liveRequests() { return [...livePerms(), ...liveQuestions()]; }
 function hasUnsnoozedPending() { return liveRequests().some(r => !snoozed.has(r.id)); }
@@ -226,7 +245,7 @@ function computeSurface() {
 
 function reconcile() {
   if (!ui.expanded) {
-    if (hasUnsnoozedPending() || completion) expand('event');
+    if ((hasUnsnoozedPending() && !focusState.suppress) || completion) expand('event');
   } else if (shouldAutoCollapse()) {
     collapse('event-done');
     renderIndicator();
@@ -238,6 +257,14 @@ function reconcile() {
   }
   setSurface(computeSurface());
   render();
+  if (deferredCompletions.size) setTimeout(flushDeferredCompletion, 0);
+}
+
+function flushDeferredCompletion() {
+  if (!deferredCompletions.size || ui.settingsOpen || hasUnsnoozedPending() || focusState.suppress || completion) return;
+  const [id, d] = deferredCompletions.entries().next().value;
+  deferredCompletions.delete(id);
+  showCompletion(d);
 }
 
 function shouldAutoCollapse() {
@@ -250,6 +277,7 @@ function setSurface(next) {
   if (ui.animating) { ui.renderQueued = true; return; }
   const prev = ui.surface;
   ui.surface = next;
+  if (prev !== next) { if (next === 'list') rearmDetailTimers(); else cancelDetailTimers(); }
   island.classList.toggle('surface-settings', next === 'settings');
   if (prev === next && SECTIONS[next].classList.contains('on')) return;
   for (const [name, sec] of Object.entries(SECTIONS)) sec.classList.toggle('on', name === next);
@@ -270,10 +298,11 @@ function expand(by) {
   if (ui.expanded) return;
   ui.expanded = true;
   ui.expandedBy = by;
-  uiLog(`expand by=${by}`);
+  if (by !== 'hover') uiLog(`expand by=${by}`);
   const seq = ++ui.animSeq;
   ui.animating = false;
   setSurface(computeSurface());
+  rearmDetailTimers();
   renderNow();
   ui.animating = true;
   island.classList.add('animating');
@@ -298,7 +327,8 @@ function collapse(reason) {
   ui.expanded = false;
   ui.expandedBy = null;
   ui.pinned = false;
-  uiLog(`collapse reason=${reason || '-'}`);
+  cancelDetailTimers();
+  if (reason !== 'mouse-leave') uiLog(`collapse reason=${reason || '-'}`);
   if (ui.settingsOpen) closeSettings(true);
   if (completion) clearCompletion();
   const seq = ++ui.animSeq;
@@ -310,10 +340,10 @@ function collapse(reason) {
   afterTransform(seq, durClose(), () => {
     island.classList.remove('animating');
     ui.animating = false;
-    completionBadge = 0;
     lastLayout = null;
     setSurface(computeSurface());
     renderNow();
+    if (deferredCompletions.size) setTimeout(flushDeferredCompletion, 0);
   });
 }
 
@@ -473,15 +503,16 @@ function sessionCounts() {
 }
 
 function renderHeader() {
-  const { total, running, pending } = sessionCounts();
-  statusDot.className = 'dot' + (pending ? ' a' : running ? ' g' : '');
-  headerStats.textContent = pending
-    ? `${running} ${t('statsRunning')} · ${pending} ${t('statsPending')}`
-    : total ? `${running} ${t('statsRunning')} · ${total} ${t('statsSessions')}` : '';
-  if (completionBadge > 0) {
-    const b = el('span', 'badge', completionBadge);
-    headerStats.appendChild(b);
-  }
+  const { total, running } = sessionCounts();
+  const { waiting, replies } = inboxCounts();
+  statusDot.className = 'dot' + (waiting ? ' a' : replies ? ' b' : running ? ' g' : '');
+  const parts = [];
+  if (waiting) parts.push(`${waiting} ${t('inboxAnswer')}`);
+  if (replies) parts.push(`${replies} ${t('inboxReplies')}`);
+  if (!parts.length && total) parts.push(`${running} ${t('statsRunning')}`, `${total} ${t('statsSessions')}`);
+  headerStats.textContent = parts.join(' · ');
+  btnDnd.classList.toggle('on', !!focusState.dnd);
+  btnDnd.title = focusState.dnd ? t('dndOn') : t('dndMenu');
   const group = currentConfig.sessionGrouping || 'status';
   groupTabs.querySelectorAll('.tab').forEach(b => b.classList.toggle('on', b.dataset.group === group));
   const muted = !currentConfig.soundEnabled;
@@ -508,18 +539,34 @@ function renderBanner() {
 let pillKey = '';
 function renderIndicator() {
   const reqs = liveRequests();
+  const { waiting, replies } = inboxCounts();
   const mode = currentConfig.collapsedMode || 'smart';
-  const showPill = mode === 'pill' || (mode === 'smart' && reqs.length > 0);
+  const showPill = mode === 'pill' || (mode === 'smart' && waiting > 0);
   indicator.classList.toggle('mode-pill', showPill);
   indicator.classList.toggle('mode-strip', !showPill);
   const { running } = sessionCounts();
-  strip.classList.toggle('pending', reqs.length > 0);
-  strip.classList.toggle('running', reqs.length === 0 && running > 0);
+  strip.classList.toggle('pending', waiting > 0);
+  strip.classList.toggle('reply', waiting === 0 && replies > 0);
+  strip.classList.toggle('running', waiting === 0 && replies === 0 && running > 0);
+  stripCount.textContent = replies && !waiting ? String(replies) : '';
   if (!showPill) return;
+  const flagged = currentState.attention.filter(a => a.kind === 'input' || a.kind === 'blocked');
 
   const sessions = currentState.sessions;
   let agent = 'claude', status = 'idle', key, build;
-  if (reqs.length) {
+  if (!reqs.length && flagged.length) {
+    const a = flagged[0];
+    agent = a.agent || 'claude';
+    status = 'waiting_permission';
+    key = `att:${a.sessionId}:${a.version}:${flagged.length}`;
+    build = () => {
+      pillText.textContent = '';
+      pillText.appendChild(el('b', '', a.name || shortId(a.sessionId)));
+      pillText.appendChild(document.createTextNode(` › ${a.kind === 'blocked' ? blockedLabel(a.reason) : t('chipNeedsTerminal')}`));
+      pillBadge.textContent = `${waiting} ${t('inboxAnswer')}`;
+      pillTime.dataset.since = String(a.since || Date.now());
+    };
+  } else if (reqs.length) {
     const oldest = reqs.slice().sort((a, b) => a.timestamp - b.timestamp)[0];
     const s = sessions.find(x => x.id === oldest.sessionId) || {};
     agent = s.agent || 'claude';
@@ -531,7 +578,7 @@ function renderIndicator() {
       pillText.textContent = '';
       pillText.appendChild(el('b', '', sessionName(s, oldest.sessionId)));
       pillText.appendChild(document.createTextNode(` › ${label}${tool && tool !== 'AskUserQuestion' ? ' · ' + tool : ''}`));
-      pillBadge.textContent = `${reqs.length} ${t('statsPending')}`;
+      pillBadge.textContent = `${waiting} ${t('inboxAnswer')}`;
       pillTime.dataset.since = String(oldest.timestamp || Date.now());
     };
   } else {
@@ -554,6 +601,17 @@ function renderIndicator() {
         pillBadge.textContent = '';
         delete pillTime.dataset.since;
         pillTime.textContent = '';
+      };
+    } else if (replies) {
+      const a = currentState.attention.filter(x => x.kind === 'reply')[0];
+      agent = a.agent || 'claude';
+      key = `reply:${replies}:${a.sessionId}:${a.version}`;
+      build = () => {
+        pillText.textContent = '';
+        pillText.appendChild(el('b', '', a.name || shortId(a.sessionId)));
+        pillText.appendChild(document.createTextNode(` › ${t('chipNewReply')}`));
+        pillBadge.textContent = '';
+        pillTime.dataset.since = String(a.since || Date.now());
       };
     } else {
       key = 'idle';
@@ -596,28 +654,61 @@ function sessionName(s, fallbackId) {
   return (s && (s.name || s.projectName)) || shortId((s && s.id) || fallbackId || '');
 }
 
-function statusView(s) {
-  if (s.isRunning === false) return { key: 'ended', chip: 'gray', label: t('chipEnded'), cls: 's-ended', mascot: 'idle' };
+function blockedLabel(reason) {
+  if (reason === 'rate_limit') return t('blockedRateLimit');
+  if (reason === 'billing_error') return t('blockedBilling');
+  return t('chipBlocked');
+}
+
+// Attention (inbox) wins over execution state: a finished turn nobody has looked at is "new reply".
+function statusView(s, rec) {
   const hasPerm = livePerms().some(p => p.sessionId === s.id);
   const hasQ = liveQuestions().some(q => q.sessionId === s.id);
-  if (hasPerm || s.status === 'waiting_permission') return { key: 'needs', chip: 'amber', label: t('chipWaiting'), cls: 's-wait', mascot: 'waiting_permission' };
-  if (hasQ || s.status === 'waiting_answer') return { key: 'needs', chip: 'blue', label: t('chipQuestion'), cls: 's-ask', mascot: 'waiting_answer' };
+  const askPerm = hasPerm && livePerms().some(p => p.sessionId === s.id && p.toolName === 'AskUserQuestion');
+  if (hasPerm || s.status === 'waiting_permission') {
+    return askPerm ? { key: 'answer', chip: 'blue', label: t('chipQuestion'), cls: 's-ask', mascot: 'waiting_answer' }
+      : { key: 'answer', chip: 'amber', label: t('chipWaiting'), cls: 's-wait', mascot: 'waiting_permission' };
+  }
+  if (hasQ || s.status === 'waiting_answer') return { key: 'answer', chip: 'blue', label: t('chipQuestion'), cls: 's-ask', mascot: 'waiting_answer' };
+  if (rec && rec.kind === 'blocked') return { key: 'answer', chip: 'red', label: blockedLabel(rec.reason), cls: 's-blocked', mascot: 'waiting_permission' };
+  if (rec && rec.kind === 'input') return { key: 'answer', chip: 'amber', label: t('chipNeedsTerminal'), cls: 's-wait', mascot: 'waiting_permission' };
+  if (rec && rec.kind === 'reply') return { key: 'reply', chip: 'blue', label: t('chipNewReply'), cls: 's-reply', mascot: 'idle' };
+  if (s.isRunning === false) return { key: 'ended', chip: 'gray', label: t('chipEnded'), cls: 's-ended', mascot: 'idle' };
   switch (s.status) {
     case 'thinking':
     case 'tool_use': return { key: 'running', chip: 'green', label: t('chipRunning'), cls: 's-run', mascot: s.status };
     case 'subagent': return { key: 'running', chip: 'violet', label: t('chipSubagent'), cls: 's-run', mascot: 'subagent' };
     case 'compacting': return { key: 'running', chip: 'cyan', label: t('chipCompacting'), cls: 's-run', mascot: 'compacting' };
+    case 'background': return { key: 'running', chip: 'violet', label: t('chipBackground'), cls: 's-run', mascot: 'thinking' };
     case 'idle': return { key: 'idle', chip: 'gray', label: t('chipIdle'), cls: 's-idle', mascot: 'idle' };
     default: return { key: 'idle', chip: 'gray', label: t('chipOnline'), cls: 's-idle', mascot: 'idle' };
   }
 }
 
-const GROUP_ORDER = ['needs', 'running', 'idle', 'ended'];
-const GROUP_LABEL = { needs: 'grpNeedsAction', running: 'grpRunning', idle: 'grpIdle', ended: 'grpEnded' };
-const GROUP_DOT = { needs: 'a', running: 'g', idle: '', ended: '' };
+const GROUP_ORDER = ['answer', 'reply', 'running', 'idle', 'ended'];
+const GROUP_LABEL = { answer: 'inboxAnswerGroup', reply: 'inboxReplyGroup', running: 'grpRunning', idle: 'grpIdle', ended: 'grpEnded' };
+const GROUP_DOT = { answer: 'a', reply: 'b', running: 'g', idle: '', ended: '' };
+
+// Inbox entries whose session already left the scan (e.g. after a restart) still get a card.
+function inboxSessions() {
+  const sessions = currentState.sessions.slice();
+  const ids = new Set(sessions.map(x => x.id));
+  for (const a of currentState.attention) {
+    if (ids.has(a.sessionId)) continue;
+    sessions.push({ id: a.sessionId, name: a.name, cwd: a.cwd, agent: a.agent, gitBranch: a.gitBranch,
+      isRunning: false, status: 'stale', lastResponse: a.text, synthetic: true });
+  }
+  return sessions;
+}
+
+function waitSince(s, rec) {
+  const reqs = liveRequests().filter(r => r.sessionId === s.id);
+  if (reqs.length) return Math.min(...reqs.map(r => r.timestamp || Date.now()));
+  return rec ? rec.since : 0;
+}
 
 function renderSessions() {
-  const sessions = currentState.sessions;
+  const sessions = inboxSessions();
   if (sessions.length === 0) {
     clearSessionCards();
     if (!emptyNode || emptyNode._hooks !== hooksInstalled) {
@@ -632,7 +723,8 @@ function renderSessions() {
   if (emptyNode && emptyNode.isConnected) emptyNode.remove();
 
   const mode = currentConfig.sessionGrouping || 'status';
-  const views = new Map(sessions.map(s => [s.id, statusView(s)]));
+  const recs = new Map(sessions.map(s => [s.id, attentionOf(s.id)]));
+  const views = new Map(sessions.map(s => [s.id, statusView(s, recs.get(s.id))]));
   const keyOf = (s) => (mode === 'status' ? views.get(s.id).key : mode === 'cli' ? 'cli:' + (s.agent || 'claude') : 'all');
   // While the cursor is over the list, order and group membership are frozen so click targets never move.
   const frozen = !!(mouseInIsland && ui.expanded && lastLayout && lastLayout.mode === mode);
@@ -640,6 +732,16 @@ function renderSessions() {
   if (frozen) {
     const idx = new Map(lastLayout.order.map((id, i) => [id, i]));
     ordered.sort((a, b) => (idx.has(a.id) ? idx.get(a.id) : 1e9) - (idx.has(b.id) ? idx.get(b.id) : 1e9));
+  } else if (mode === 'status') {
+    // Inside the inbox groups the longest-waiting session comes first.
+    const since = new Map(sessions.map(s => [s.id, waitSince(s, recs.get(s.id))]));
+    const pos = new Map(sessions.map((s, i) => [s.id, i]));
+    ordered.sort((a, b) => {
+      const ka = views.get(a.id).key, kb = views.get(b.id).key;
+      if (ka !== kb) return GROUP_ORDER.indexOf(ka) - GROUP_ORDER.indexOf(kb);
+      if (ka === 'answer' || ka === 'reply') return since.get(a.id) - since.get(b.id);
+      return pos.get(a.id) - pos.get(b.id);
+    });
   }
 
   const groups = new Map();
@@ -666,7 +768,7 @@ function renderSessions() {
     const folded = mode === 'status' && foldedGroups.has(key);
     if (folded) continue;
     for (const s of items) {
-      nodes.push(sessionCard(s, views.get(s.id)));
+      nodes.push(sessionCard(s, views.get(s.id), recs.get(s.id)));
       seen.add(s.id);
     }
   }
@@ -727,7 +829,7 @@ function groupHeader(key, count, mode) {
   return h;
 }
 
-function sessionCard(s, view) {
+function sessionCard(s, view, rec) {
   let c = sessionCards.get(s.id);
   if (!c) {
     const root = el('div', 'card');
@@ -739,37 +841,66 @@ function sessionCard(s, view) {
     const name = el('span', 'name');
     const branch = el('span', 'branch');
     const meta = el('span', 'meta');
+    const bell = el('button', 'cbtn bell');
+    bell.innerHTML = BELL_SVG;
+    bell.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const on = !currentState.alertNext.includes(s.id);
+      window.codePeek.setAlertNext(s.id, on);
+      showToast(on ? t('alertNextOn') : t('alertNextOff'), 'success');
+    });
+    const read = el('button', 'cbtn read');
+    read.appendChild(icon('E73E'));
+    read.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const rec = attentionOf(s.id);
+      if (rec && rec.kind === 'reply') window.codePeek.markSeen(s.id, rec.version);
+    });
     const time = el('span', 'tchip');
     const term = el('span', 'term');
-    meta.append(time, term);
+    meta.append(read, bell, time, term);
     row1.append(chip, name, branch, meta);
     const prompt = el('div', 'line prompt');
     const reply = el('div', 'line reply');
+    const more = el('button', 'more');
+    more.addEventListener('click', (e) => { e.stopPropagation(); toggleDetail(s.id); });
+    const detail = el('div', 'detail');
+    detail.addEventListener('click', (e) => e.stopPropagation());
     const tool = el('div', 'tool');
     const err = el('div', 'line err');
-    main.append(row1, prompt, reply, tool, err);
+    main.append(row1, prompt, reply, more, detail, tool, err);
     root.append(av, main);
     root.addEventListener('click', (e) => handleSessionClick(s.id, e));
-    c = { el: root, refs: { av, chip, name, branch, time, term, prompt, reply, tool, err }, fp: '' };
+    c = { el: root, refs: { av, chip, name, branch, read, bell, time, term, prompt, reply, more, detail, tool, err }, fp: '' };
     sessionCards.set(s.id, c);
   }
   const toolInfo = toolLineFor(s, view);
-  const fp = [view.cls, view.label, sessionName(s), s.gitBranch, s.lastPrompt, s.lastResponse, s.lastError, s.pid,
+  // An inbox entry's own text is authoritative even when empty (e.g. an error with no body).
+  const replyText = rec ? (rec.text || '') : (s.lastResponse || '');
+  const since = (view.key === 'answer' || view.key === 'reply') ? waitSince(s, rec) : 0;
+  const alertNext = currentState.alertNext.includes(s.id);
+  const open = openDetails.has(s.id);
+  const fp = [view.cls, view.label, sessionName(s), s.gitBranch, s.lastPrompt, replyText, s.lastError, s.pid, s.isRunning,
     toolInfo ? `${toolInfo.cls}|${toolInfo.name}|${toolInfo.arg}|${toolInfo.linger}` : '', s.id === selectedSessionId,
-    currentConfig.mascotEnabled].join('\u0001');
+    currentConfig.mascotEnabled, rec ? `${rec.kind}:${rec.version}` : '', since, alertNext, open].join('\u0001');
   const r = c.refs;
-  r.time.textContent = formatTimeAgo(s.lastActivity || s.lastActivityAt || s.startedAt);
+  setTimeChip(r.time, s, since);
   setMascot(r.av, s.agent || 'claude', view.mascot, 36);
   if (fp === c.fp) return c.el;
   c.fp = fp;
 
-  c.el.className = 'card ' + view.cls + (s.id === selectedSessionId ? ' selected' : '');
+  c.el.className = 'card ' + view.cls + (s.id === selectedSessionId ? ' selected' : '') + (alertNext ? ' alert-next' : '');
   c.el.title = [s.model ? formatModel(s.model) : '', s.cwd || ''].filter(Boolean).join(' · ');
   r.chip.className = 'chip ' + view.chip;
   r.chip.textContent = view.label;
   r.name.textContent = sessionName(s);
   r.branch.textContent = s.gitBranch ? `⑂ ${s.gitBranch}` : '';
   r.branch.style.display = s.gitBranch ? '' : 'none';
+  r.bell.classList.toggle('on', alertNext);
+  r.bell.title = alertNext ? t('alertNextOff') : t('alertNextOn');
+  r.bell.style.display = s.isRunning === false ? 'none' : '';
+  r.read.style.display = rec && rec.kind === 'reply' ? '' : 'none';
+  r.read.title = t('markRead');
   r.term.textContent = '';
   if (s.isRunning === false) {
     r.term.appendChild(icon('E72C'));
@@ -780,7 +911,13 @@ function sessionCard(s, view) {
     r.term.appendChild(document.createTextNode((a && a.name) || (s.agent || 'claude')));
   }
   setText(r.prompt, s.lastPrompt);
-  setText(r.reply, s.lastResponse);
+  setText(r.reply, open ? '' : replyText);
+  // The full reply is on demand; opening it for a moment counts as having read this version.
+  const expandable = !!replyText && (view.key === 'reply' || replyText.length > 90 || replyText.includes('\n'));
+  r.more.style.display = expandable ? '' : 'none';
+  r.more.textContent = open ? t('showLess') : t('showReply');
+  r.detail.style.display = open ? '' : 'none';
+  if (open) r.detail.textContent = replyText;
   setText(r.err, s.lastError ? '⚠ ' + String(s.lastError).substring(0, 160) : '');
   r.tool.textContent = '';
   r.tool.style.display = toolInfo ? '' : 'none';
@@ -792,6 +929,57 @@ function sessionCard(s, view) {
   return c.el;
 }
 
+const BELL_SVG = '<svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><path d="M4 11V7a4 4 0 0 1 8 0v4l1.2 1.5H2.8z"/><path d="M6.5 14a1.6 1.6 0 0 0 3 0"/></svg>';
+
+function setTimeChip(node, s, since) {
+  if (since) {
+    node.dataset.wait = String(since);
+    node.textContent = formatWait(since);
+    node.classList.add('wait');
+  } else {
+    delete node.dataset.wait;
+    node.classList.remove('wait');
+    node.textContent = formatTimeAgo(s.lastActivity || s.lastActivityAt || s.startedAt);
+  }
+}
+
+function formatWait(since) {
+  const min = Math.floor((Date.now() - since) / 60000);
+  const d = min < 1 ? '<1m' : min < 60 ? `${min}m` : min < 1440 ? `${Math.floor(min / 60)}h${min % 60 ? String(min % 60).padStart(2, '0') : ''}` : `${Math.floor(min / 1440)}d`;
+  return fmt('waitedFor', { d });
+}
+
+// The read timer only runs while the open detail is actually on screen; leaving restarts the full second.
+function armDetailTimer(sessionId) {
+  clearTimeout(detailTimers.get(sessionId));
+  detailTimers.delete(sessionId);
+  const rec = attentionOf(sessionId);
+  if (!openDetails.has(sessionId) || !rec || rec.kind !== 'reply') return;
+  const version = rec.version;
+  detailTimers.set(sessionId, setTimeout(() => {
+    detailTimers.delete(sessionId);
+    if (openDetails.has(sessionId) && ui.expanded && ui.surface === 'list' && !document.hidden) window.codePeek.markSeen(sessionId, version);
+  }, DETAIL_SEEN_MS));
+}
+
+function cancelDetailTimers() {
+  for (const timer of detailTimers.values()) clearTimeout(timer);
+  detailTimers.clear();
+}
+
+function rearmDetailTimers() {
+  if (ui.expanded && ui.surface === 'list' && !document.hidden) openDetails.forEach(armDetailTimer);
+}
+
+function toggleDetail(sessionId) {
+  if (openDetails.has(sessionId)) openDetails.delete(sessionId);
+  else openDetails.add(sessionId);
+  armDetailTimer(sessionId);
+  const c = sessionCards.get(sessionId);
+  if (c) c.fp = '';
+  renderSessions();
+}
+
 function setText(node, text) {
   const v = text ? String(text) : '';
   node.textContent = v;
@@ -799,7 +987,7 @@ function setText(node, text) {
 }
 
 function toolLineFor(s, view) {
-  if (view.key === 'needs') {
+  if (view.key === 'answer') {
     const p = livePerms().find(x => x.sessionId === s.id);
     if (p) {
       const d = p.display || {};
@@ -1158,6 +1346,39 @@ function buildAskCard(p) {
 
   card._refresh = refreshFoot;
   card._isAsk = true;
+  card._onKey = (e) => {
+    const active = document.activeElement;
+    if (active && active.tagName === 'BUTTON' && !active.classList.contains('opt') && (e.key === 'Enter' || e.key === ' ')) return;
+    const inText = active && active.tagName === 'TEXTAREA';
+    const rows = Array.from(opts.querySelectorAll('.opt'));
+    const q = qs[st.step];
+    if (!inText && /^[1-9]$/.test(e.key)) {
+      const row = rows[Number(e.key) - 1];
+      if (row) { e.preventDefault(); row.click(); }
+      return;
+    }
+    if (!inText && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
+      e.preventDefault();
+      const cur = rows.indexOf(document.activeElement);
+      const next = cur < 0 ? 0 : (cur + (e.key === 'ArrowDown' ? 1 : -1) + rows.length) % rows.length;
+      if (rows[next]) rows[next].focus();
+      return;
+    }
+    if (e.key === 'Enter' && e.ctrlKey) {
+      e.preventDefault();
+      submit(foot.querySelector('.btn.allow'));
+      return;
+    }
+    if (e.key === 'Enter' && !inText) {
+      const next = foot.querySelector('.btn.allow');
+      if (next && !next.disabled) { e.preventDefault(); next.click(); }
+      return;
+    }
+    if (e.key === ' ' && !inText && q.multiSelect && rows.includes(document.activeElement)) {
+      e.preventDefault();
+      document.activeElement.click();
+    }
+  };
   draw();
   return card;
 }
@@ -1216,18 +1437,25 @@ function buildQuestionCard(q) {
 }
 
 // ---------- Completion ----------
+
+// Main already allowed this interruption; here it only yields to a pending request or a list being browsed.
 function handleCompletion(data) {
   if (!data) return;
-  const suppress = (why) => {
-    console.log(`[completion] suppressed: ${why}`);
-    completionBadge++;
-    renderHeader();
+  const kind = data.kind || 'completion';
+  const skip = (why) => {
+    console.log(`[completion] skipped kind=${kind}: ${why}`);
+    if (data.alertNext) {
+      deferredCompletions.delete(data.sessionId);
+      deferredCompletions.set(data.sessionId, data);
+    }
   };
-  if (hasUnsnoozedPending()) return suppress('blocking request');
-  if (ui.settingsOpen) return suppress('settings open');
-  if (ui.expanded && ui.expandedBy !== 'event' && ui.surface === 'list') return suppress('user browsing');
-  if (!mouseInIsland && Date.now() - lastKeyAt < INPUT_ACTIVE_MS) return suppress('typing');
-  if (Date.now() - lastCompletionShownAt < COMPLETION_THROTTLE_MS) return suppress('throttled');
+  if (focusState.suppress && kind !== 'summary') return skip('quiet period');
+  if (ui.settingsOpen) return skip('settings open');
+  if (kind === 'completion') {
+    if (hasUnsnoozedPending()) return skip('blocking request');
+    if (ui.expanded && ui.expandedBy !== 'event' && ui.surface === 'list') return skip('user browsing');
+    if (!data.alertNext && Date.now() - lastCompletionShownAt < COMPLETION_THROTTLE_MS) return skip('throttled');
+  }
   showCompletion(data);
 }
 
@@ -1235,8 +1463,9 @@ function showCompletion(data) {
   if (completion && completion.timer) clearTimeout(completion.timer);
   completion = { data, timer: null, hover: false };
   lastCompletionShownAt = Date.now();
-  playSound('complete');
-  console.log(`[completion] show: expanded=${ui.expanded}`);
+  const kind = data.kind || 'completion';
+  if (data.sound && !focusState.suppress) playSound(kind === 'completion' ? 'complete' : kind === 'summary' ? 'question' : 'permission');
+  console.log(`[completion] show kind=${kind} expanded=${ui.expanded}`);
   completionBody.textContent = '';
   reconcile();
 }
@@ -1270,29 +1499,47 @@ function renderCompletion() {
   if (!completion) { completionBody.textContent = ''; return; }
   if (completionBody.firstElementChild && completionBody.firstElementChild._data === completion.data) return;
   const d = completion.data;
-  const card = el('div', 'done');
+  const kind = d.kind || 'completion';
+  const card = el('div', 'done k-' + kind);
   card._data = d;
   card.style.setProperty('--countdown', completionMs() + 'ms');
   const ok = el('div', 'ok');
-  ok.appendChild(icon('E73E'));
   const body = el('div');
   body.style.minWidth = '0';
   const t1 = el('div', 't1');
-  t1.appendChild(el('span', 'chip green', t('completionDone')));
-  t1.appendChild(el('span', 'name', (d.projectName || d.sessionTitle || t('completionUntitled')).trim()));
-  if (d.gitBranch) t1.appendChild(el('span', 'branch', `⑂ ${d.gitBranch}`));
+  if (kind === 'summary') {
+    ok.appendChild(icon('E823'));
+    t1.appendChild(el('span', 'chip blue', t('summaryTitle')));
+    const bits = [];
+    if (d.questions) bits.push(`${d.questions} ${t('inboxAnswer')}`);
+    if (d.inputs) bits.push(`${d.inputs} ${t('chipNeedsTerminal')}`);
+    if (d.blocked) bits.push(`${d.blocked} ${t('chipBlocked')}`);
+    if (d.replies) bits.push(`${d.replies} ${t('inboxReplies')}`);
+    t1.appendChild(el('span', 'name', bits.join(' · ')));
+  } else {
+    ok.appendChild(icon(kind === 'blocked' ? 'E711' : kind === 'input' ? 'E7BA' : 'E73E'));
+    const chip = kind === 'blocked' ? ['red', blockedLabel(d.reason)] : kind === 'input' ? ['amber', t('chipNeedsTerminal')] : ['green', t('completionDone')];
+    t1.appendChild(el('span', 'chip ' + chip[0], chip[1]));
+    t1.appendChild(el('span', 'name', (d.projectName || d.sessionTitle || t('completionUntitled')).trim()));
+    if (d.gitBranch) t1.appendChild(el('span', 'branch', `⑂ ${d.gitBranch}`));
+  }
   body.appendChild(t1);
-  const summary = (d.lastResponse || d.sessionTitle || d.cwd || '').toString().trim();
+  const summary = kind === 'summary' ? t('summaryHint') : (d.lastResponse || d.sessionTitle || d.cwd || '').toString().trim();
   if (summary) body.appendChild(el('div', 't2', summary));
   const view = el('span', 'term');
-  view.appendChild(icon('E8A7'));
-  view.appendChild(document.createTextNode(t('completionView')));
+  view.appendChild(icon(kind === 'summary' ? 'E8FD' : 'E8A7'));
+  view.appendChild(document.createTextNode(kind === 'summary' ? t('summaryView') : t('completionView')));
   card.append(ok, body, view, el('div', 'bar'));
   card.addEventListener('mouseenter', () => { if (completion) { completion.hover = true; clearTimeout(completion.timer); } });
   card.addEventListener('mouseleave', () => { if (completion) { completion.hover = false; startCompletionTimer(); } });
   card.addEventListener('click', () => {
     const snap = completion && completion.data;
     clearCompletion();
+    if (snap && snap.kind === 'summary') {
+      ui.expandedBy = 'click';
+      openRequests(null);
+      return;
+    }
     collapse('completion-click');
     if (snap) jumpToSession(snap.sessionId, snap);
   });
@@ -1314,15 +1561,17 @@ function tickClocks() {
   }
   if (ui.expanded && ui.surface === 'list') {
     for (const [id, c] of sessionCards) {
+      const tchip = c.refs.time;
+      if (tchip.dataset.wait) { tchip.textContent = formatWait(Number(tchip.dataset.wait)); continue; }
       const s = currentState.sessions.find(x => x.id === id);
-      if (s) c.refs.time.textContent = formatTimeAgo(s.lastActivity || s.lastActivityAt || s.startedAt);
+      if (s) tchip.textContent = formatTimeAgo(s.lastActivity || s.lastActivityAt || s.startedAt);
     }
   }
 }
 
 // ========== Actions ==========
 async function handleSessionClick(sessionId, event) {
-  const s = currentState.sessions.find(x => x.id === sessionId);
+  const s = inboxSessions().find(x => x.id === sessionId);
   if (!s) return;
   if (event.shiftKey || event.ctrlKey) {
     selectedSessionId = selectedSessionId === sessionId ? null : sessionId;
@@ -1348,6 +1597,7 @@ async function jumpToSession(sessionId, snapshot) {
   const cwd = (s.cwd || (snapshot && snapshot.cwd) || '').toString();
   const agent = s.agent || (snapshot && snapshot.agent) || '';
   let pid = s.pid;
+  const borrowed = !pid;
   if (!pid && cwd) {
     const parent = sessions.find(x => x.pid && x.isRunning !== false && x.cwd === cwd && x.agent !== agent)
       || sessions.find(x => x.pid && x.isRunning !== false && x.cwd === cwd);
@@ -1355,11 +1605,30 @@ async function jumpToSession(sessionId, snapshot) {
   }
   if (!pid) { showToast(t('menuNoPid'), 'error'); return; }
   const name = (s.name || (snapshot && (snapshot.sessionTitle || snapshot.projectName)) || '').toString();
+  const rec = attentionOf(sessionId);
   const result = await window.codePeek.jumpToTerminal(pid, name, cwd);
   if (!result || !result.success) {
     const err = (result && result.error) || '';
     showToast(/NO_WINDOW|No ancestors/i.test(err) ? t('sessionClosed') : `${t('menuJumpFailed')}: ${err || 'Unknown'}`, 'error');
+    return;
   }
+  // Only an exact tab match proves the user is now looking at this session; a raised window does not.
+  if (result.level === 'tab' && !borrowed && rec && rec.kind === 'reply') window.codePeek.markSeen(sessionId, rec.version);
+  else if (result.level !== 'tab') showToast(t('jumpWindowOnly'), 'success');
+}
+
+// "next": open the oldest waiting request, else jump to the session that has waited longest for you.
+function handleShortcut(action) {
+  if (action === 'toggle') {
+    if (ui.expanded) userCollapse('shortcut');
+    else expand('click');
+    return;
+  }
+  if (action !== 'next') return;
+  if (liveRequests().length) { openRequests(null); return; }
+  const queue = currentState.attention.slice().sort((a, b) => a.since - b.since);
+  if (queue.length) { jumpToSession(queue[0].sessionId, { cwd: queue[0].cwd, agent: queue[0].agent, sessionTitle: queue[0].name }); return; }
+  if (ui.expanded) userCollapse('shortcut'); else expand('click');
 }
 
 function playSound(type) {
@@ -1541,6 +1810,32 @@ btnPin.addEventListener('click', (e) => {
   showToast(ui.pinned ? t('toastPinned') : t('toastUnpinned'), 'success');
   renderHeader();
 });
+// Do-not-disturb: no auto-expansion and no sounds until it ends; the inbox keeps recording.
+btnDnd.addEventListener('click', (e) => {
+  e.stopPropagation();
+  document.querySelectorAll('.context-menu').forEach(m => m.remove());
+  const menu = el('div', 'context-menu');
+  const items = focusState.dnd ? [[0, t('dndOff')]] : [[30, t('dnd30')], [60, t('dnd60')], [-1, t('dndUntilOff')]];
+  for (const [minutes, label] of items) {
+    const it = el('div', 'context-item', label);
+    it.onclick = async () => {
+      menu.remove();
+      try { focusState = await window.codePeek.setDnd(minutes) || focusState; } catch {}
+      renderHeader();
+      showToast(minutes === 0 ? t('dndOff') : t('dndOn'), 'success');
+    };
+    menu.appendChild(it);
+  }
+  const r = btnDnd.getBoundingClientRect();
+  menu.style.left = Math.min(r.left, window.innerWidth - 180) + 'px';
+  menu.style.top = (r.bottom + 4) + 'px';
+  document.body.appendChild(menu);
+  setTimeout(() => {
+    const close = () => { menu.remove(); document.removeEventListener('click', close); };
+    document.addEventListener('click', close);
+  }, 0);
+});
+
 btnMute.addEventListener('click', (e) => {
   e.stopPropagation();
   window.codePeek.setConfig({ soundEnabled: !currentConfig.soundEnabled });
@@ -1557,9 +1852,16 @@ pendingBanner.addEventListener('click', () => {
 
 function onKeyDown(e) {
   lastKeyAt = Date.now();
-  if (e.key !== 'Escape' || e.isComposing || composing) return;
-  if (ui.settingsOpen) closeSettings();
-  else if (ui.expanded) userCollapse('esc');
+  if (e.isComposing || composing) return;
+  if (e.key === 'Escape') {
+    if (ui.settingsOpen) closeSettings();
+    else if (ui.expanded) userCollapse('esc');
+    return;
+  }
+  if (ui.expanded && ui.surface === 'approval') {
+    const card = permissionsList.firstElementChild;
+    if (card && card._onKey && !card.classList.contains('is-resolved')) card._onKey(e);
+  }
 }
 
 island.addEventListener('contextmenu', (e) => {
@@ -1627,7 +1929,13 @@ function populateSettings() {
   setRange('rangeHoverExpandDelay', 'valHoverExpandDelay', currentConfig.hoverExpandDelay, 'ms');
   setRange('rangeHoverCollapseDelay', 'valHoverCollapseDelay', currentConfig.hoverCollapseDelay, 'ms');
   setRange('rangeCompletionTime', 'valCompletionTime', currentConfig.completionDisplayTime || 5, 's');
-  $('chkSuppressNotif').checked = !!currentConfig.suppressNotifications;
+  const alertMode = currentConfig.completionAlert || 'quiet';
+  document.querySelectorAll('#segCompletionAlert span').forEach(x => x.classList.toggle('on', x.dataset.v === alertMode));
+  setRange('rangeShortTurn', 'valShortTurn', currentConfig.shortTurnSeconds || 20, 's');
+  setRange('rangeAwayIdle', 'valAwayIdle', Math.round((currentConfig.awayIdleSeconds || 120) / 60), 'min');
+  $('valShortcutToggle').textContent = prettyAccel(currentConfig.shortcutToggle);
+  $('valShortcutNext').textContent = prettyAccel(currentConfig.shortcutNext);
+  refreshHealth();
   $('numCleanup').value = currentConfig.cleanupStaleAfter;
 
   setRange('rangePanelWidth', 'valPanelWidth', currentConfig.panelWidth, 'px');
@@ -1744,7 +2052,23 @@ bindRangeLabel('rangeHoverCollapseDelay', 'valHoverCollapseDelay', 'ms');
 bindConfig('rangeHoverCollapseDelay', 'change', x => ({ hoverCollapseDelay: parseInt(x.value) || 0 }));
 bindRangeLabel('rangeCompletionTime', 'valCompletionTime', 's');
 bindConfig('rangeCompletionTime', 'change', x => ({ completionDisplayTime: parseInt(x.value) || 5 }));
-bindConfig('chkSuppressNotif', 'change', x => ({ suppressNotifications: x.checked }));
+$('segCompletionAlert').addEventListener('click', (e) => {
+  const sp = e.target.closest('span[data-v]');
+  if (!sp) return;
+  document.querySelectorAll('#segCompletionAlert span').forEach(x => x.classList.toggle('on', x === sp));
+  window.codePeek.setConfig({ completionAlert: sp.dataset.v, suppressNotifications: false });
+});
+bindRangeLabel('rangeShortTurn', 'valShortTurn', 's');
+bindConfig('rangeShortTurn', 'change', x => ({ shortTurnSeconds: parseInt(x.value) || 20 }));
+bindRangeLabel('rangeAwayIdle', 'valAwayIdle', 'min');
+bindConfig('rangeAwayIdle', 'change', x => ({ awayIdleSeconds: (parseInt(x.value) || 2) * 60 }));
+$('btnHealthCheck').addEventListener('click', () => refreshHealth(true));
+$('btnHealthRepair').addEventListener('click', async () => {
+  const r = await window.codePeek.repairHooks();
+  showToast(r && r.success ? t('healthRepaired') : ((r && r.error) || t('operationFailed')), r && r.success ? 'success' : 'error');
+  refreshHealth();
+  updateHookStatus();
+});
 bindConfig('numCleanup', 'change', x => ({ cleanupStaleAfter: parseInt(x.value) || 0 }));
 bindRangeLabel('rangePanelWidth', 'valPanelWidth', 'px');
 bindConfig('rangePanelWidth', 'change', x => ({ panelWidth: parseInt(x.value) }));
@@ -1831,6 +2155,32 @@ function formatModel(model) {
 }
 
 function shortId(id) { return (id || '').substring(0, 8); }
+
+function prettyAccel(a) {
+  return String(a || '').replace(/Control/g, 'Ctrl').replace(/\+/g, ' + ') || '—';
+}
+
+async function refreshHealth(announce) {
+  let h;
+  try { h = await window.codePeek.getHealth(); } catch { return; }
+  const hooks = h.hooks || {};
+  const set = (id, ok, text) => {
+    const n = $(id);
+    n.textContent = text;
+    n.className = 'hstate ' + (ok === null ? '' : ok ? 'ok' : 'bad');
+  };
+  set('hHooks', hooks.installed && !hooks.missing.length && !hooks.stale.length,
+    !hooks.installed ? t('notInstalled') : hooks.missing.length ? fmt('healthMissing', { n: hooks.missing.length, list: hooks.missing.join(', ') }) : t('healthOk'));
+  set('hBridge', hooks.bridgeCurrent, hooks.bridgeCurrent ? t('healthOk') : hooks.bridgeDeployed ? t('healthOutdated') : t('notInstalled'));
+  set('hServer', !!h.serverListening, h.serverListening ? `127.0.0.1:${h.port}` : t('healthDown'));
+  set('hLastEvent', null, h.lastEventAt ? fmt('healthAgo', { d: formatTimeAgo(h.lastEventAt) }) : t('healthNoEvent'));
+  set('hForeground', !!h.foregroundWatcher, h.foregroundWatcher ? t('healthOk') : t('healthUnavailable'));
+  const conflicts = h.shortcutConflicts || [];
+  $('rowShortcutConflict').style.display = conflicts.length ? '' : 'none';
+  $('valShortcutConflict').textContent = conflicts.map(prettyAccel).join(', ');
+  $('btnHealthRepair').style.display = hooks.installed && (hooks.missing.length || hooks.stale.length || !hooks.bridgeCurrent) ? '' : 'none';
+  if (announce) showToast(t('healthChecked'), 'success');
+}
 
 let toastTimer = null;
 function showToast(message, type = 'success') {

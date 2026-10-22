@@ -62,6 +62,7 @@ function buildFocusScript(ancestorPids, sessionName, cwd) {
   return `
 $AncestorPids = @(${pidArray})
 $TargetName = '${safeName}'
+$TargetClean = ($TargetName -replace '^[^\\p{L}\\p{N}]+', '').Trim().ToLowerInvariant()
 $Candidates = @(${candList})
 
 # Find the first ancestor with a top-level window
@@ -129,7 +130,8 @@ if ($isWindowsTerminal -and $TargetName) {
       foreach ($tab in $tabs) {
         $tabName = $tab.Current.Name
         if (-not $tabName) { continue }
-        $tabLower = $tabName.ToLowerInvariant()
+        # Claude Code prefixes tab titles with a status glyph; compare without it.
+        $tabLower = ($tabName -replace '^[^\\p{L}\\p{N}]+', '').Trim().ToLowerInvariant()
         $tabNorm = $tabLower.Replace('\\','/')
         foreach ($cand in $Candidates) {
           if (-not $cand) { continue }
@@ -148,11 +150,17 @@ if ($isWindowsTerminal -and $TargetName) {
         if ($matchedScore -eq 3) { break }
       }
 
+      $exactTabs = @($tabs | Where-Object { (($_.Current.Name -replace '^[^\\p{L}\\p{N}]+', '').Trim().ToLowerInvariant()) -eq $TargetClean })
+      if ($TargetClean -and $exactTabs.Count -eq 1) { $matched = $exactTabs[0] }
       if ($matched) {
+        # Only a unique tab whose title equals the session name proves the right session is shown.
+        $matchedClean = ($matched.Current.Name -replace '^[^\\p{L}\\p{N}]+', '').Trim().ToLowerInvariant()
+        $sameName = @($tabs | Where-Object { (($_.Current.Name -replace '^[^\\p{L}\\p{N}]+', '').Trim().ToLowerInvariant()) -eq $TargetClean }).Count
+        if ($TargetClean -and $matchedClean -eq $TargetClean -and $sameName -eq 1) { $matchedScore = 3 } elseif ($matchedScore -eq 3) { $matchedScore = 2 }
         $selPattern = $matched.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern)
         if ($selPattern) {
           $selPattern.Select()
-          $tabResult = "tab-switched:$($matched.Current.Name)"
+          $tabResult = "tab-switched:$($matchedScore):$($matched.Current.Name)"
         } else {
           $tabResult = "tab-no-pattern"
         }
@@ -196,7 +204,10 @@ function focusTerminalByPid(pid, sessionName, cwd) {
     ps.on('close', (code) => {
       const result = output.trim();
       if (code === 0 && result.startsWith('OK:')) {
-        resolve({ success: true, detail: result.slice(3) });
+        // level: "tab" = exact tab match, "tab-fuzzy" = partial match, "window" = only the window was raised.
+        const m = /tab-switched:(\d)/.exec(result);
+        const level = m ? (m[1] === '3' ? 'tab' : 'tab-fuzzy') : 'window';
+        resolve({ success: true, level, detail: result.slice(3) });
       } else {
         resolve({ success: false, error: result || `Exit ${code}` });
       }

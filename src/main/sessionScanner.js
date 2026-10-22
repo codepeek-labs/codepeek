@@ -412,8 +412,10 @@ foreach ($p in $procs) {
       let buf = '';
       ps.stdout.on('data', d => { buf += d.toString(); });
       ps.stderr.on('data', () => {});
-      const finish = () => {
+      const finish = (code) => {
         this._procTableRefreshing = false;
+        // A killed or failed query may have printed only part of the table; orphan reaping must never see that.
+        if (code !== 0) { resolve(); return; }
         const next = new Map();
         for (const line of buf.split('\n')) {
           const parts = line.trim().split(';');
@@ -432,6 +434,7 @@ foreach ($p in $procs) {
         // until the next setProcMap() call, which creates a ~5s window where jumpToTerminal fails
         // with "No ancestors for PID" even though the process is actually in the fresh table.
         if (next.size > 0) {
+          this._procGen = (this._procGen || 0) + 1;
           this._procMap.clear();
           for (const [k, v] of next) this._procMap.set(k, v);
         }
