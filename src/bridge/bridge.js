@@ -11,6 +11,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const crypto = require('crypto');
 
 // Parse the --source argument (defaults to 'claude' for backward compatibility with older deployments).
 function parseSource() {
@@ -72,7 +73,8 @@ process.stdin.on('end', () => {
   }
 
   // Inject bridge metadata
-  event.bridge_version = '1.1.0';
+  event.bridge_version = '1.2.0';
+  event.bridge_request_id = crypto.randomUUID ? crypto.randomUUID() : String(Date.now());
   event.bridge_platform = 'windows';
   event.bridge_timestamp = new Date().toISOString();
   event.bridge_pid = process.pid;

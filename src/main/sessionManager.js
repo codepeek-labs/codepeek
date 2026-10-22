@@ -1,9 +1,12 @@
 'use strict';
 
 const { EventEmitter } = require('events');
+const crypto = require('crypto');
 const config = require('./config');
 const { detectAgentFromEvent } = require('./agents');
 const { normalizeEvent } = require('./eventNormalizer');
+const TranscriptWatcher = require('./transcriptWatcher');
+const { debugLog } = require('./debugLog');
 
 // Stale-session cleanup timeout (configurable).
 function getSessionTimeout() {
@@ -11,15 +14,138 @@ function getSessionTimeout() {
   return (s || 300) * 1000;
 }
 
+const PENDING_TTL = 10 * 60 * 1000;
+const RESOLVED_KEEP_MS = 3000;
+const MAX_CALLS_PER_SESSION = 200;
+const MAX_TEXT = 8000;
+const MAX_ANSWER = 4000;
+const BUILTIN_AUTO_APPROVE = ['TaskCreate', 'TaskUpdate', 'TaskGet', 'TaskList', 'TaskOutput', 'TaskStop',
+  'TodoRead', 'TodoWrite', 'EnterPlanMode', 'ExitPlanMode'];
+
+const DENY = JSON.stringify({ hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'deny' } } });
+// No decision: Claude keeps its own prompt. Background subagents cannot prompt and treat this as a deny.
+const NO_DECISION = '{}';
+
+function stableStringify(value) {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value === undefined ? null : value);
+  if (Array.isArray(value)) return '[' + value.map(stableStringify).join(',') + ']';
+  const keys = Object.keys(value).sort();
+  return '{' + keys.map(k => JSON.stringify(k) + ':' + stableStringify(value[k])).join(',') + '}';
+}
+
+function inputKeyOf(toolInput) {
+  return crypto.createHash('sha1').update(stableStringify(toolInput || null)).digest('hex');
+}
+
+// Subagent hook events carry agent_id; older CLIs may only send agent_transcript_path or agent_type.
+function actorOf(event) {
+  if (event.agent_id) return String(event.agent_id);
+  if (event.agent_transcript_path || event.agent_type) return 'sub:' + String(event.agent_transcript_path || event.agent_type);
+  return 'main';
+}
+
+function clip(v, n = MAX_TEXT) {
+  if (v === undefined || v === null) return '';
+  return String(v).substring(0, n);
+}
+
+// Picks one scoped rule so "always allow" never grants more than the label shows.
+function pickSessionRule(suggestions) {
+  if (!Array.isArray(suggestions)) return null;
+  for (const s of suggestions) {
+    if (!s || s.type !== 'addRules' || s.behavior !== 'allow' || !Array.isArray(s.rules) || s.rules.length === 0) continue;
+    const rules = s.rules.filter(r => r && typeof r.toolName === 'string' && r.toolName);
+    if (rules.length === 0) continue;
+    const label = rules.map(r => (r.ruleContent ? `${r.toolName}(${r.ruleContent})` : r.toolName)).join(', ');
+    return { update: { type: 'addRules', rules, behavior: 'allow', destination: 'session' }, label: label.substring(0, 160) };
+  }
+  return null;
+}
+
+function buildDisplay(toolName, input, cwd) {
+  const d = { title: toolName || '', command: '', description: '', path: '', detail: '', cwd: cwd || '' };
+  if (!input || typeof input !== 'object') {
+    d.command = clip(typeof input === 'string' ? input : '');
+    return d;
+  }
+  switch (toolName) {
+    case 'Bash':
+    case 'PowerShell':
+      d.command = clip(input.command);
+      d.description = clip(input.description, 400);
+      break;
+    case 'Edit':
+    case 'MultiEdit':
+      d.path = clip(input.file_path, 1000);
+      if (typeof input.old_string === 'string' || typeof input.new_string === 'string') {
+        const minus = clip(input.old_string, 2000).split('\n').map(l => '- ' + l).join('\n');
+        const plus = clip(input.new_string, 2000).split('\n').map(l => '+ ' + l).join('\n');
+        d.detail = clip(minus + '\n' + plus);
+      } else if (Array.isArray(input.edits)) {
+        d.description = `${input.edits.length} edits`;
+      }
+      break;
+    case 'Write':
+      d.path = clip(input.file_path, 1000);
+      d.detail = clip(input.content, 3000);
+      break;
+    case 'Read':
+    case 'NotebookEdit':
+      d.path = clip(input.file_path || input.notebook_path, 1000);
+      break;
+    case 'WebFetch':
+      d.command = clip(input.url, 2000);
+      d.description = clip(input.prompt, 400);
+      break;
+    case 'WebSearch':
+      d.command = clip(input.query, 1000);
+      break;
+    case 'Grep':
+    case 'Glob':
+      d.command = clip(input.pattern, 1000);
+      d.path = clip(input.path, 1000);
+      break;
+    case 'Task':
+    case 'Agent':
+      d.description = clip(input.description, 400);
+      d.command = clip(input.prompt, 2000);
+      break;
+    default:
+      try { d.command = clip(JSON.stringify(input, null, 2)); } catch {}
+  }
+  return d;
+}
+
+// Validates AskUserQuestion answers against the original questions; multi-select joins labels with ", ".
+function normalizeAnswers(questions, answers) {
+  if (!Array.isArray(questions) || !answers || typeof answers !== 'object') return null;
+  const out = {};
+  for (const q of questions) {
+    const key = q && typeof q.question === 'string' ? q.question : null;
+    if (!key) return null;
+    let v = answers[key];
+    if (Array.isArray(v)) v = v.filter(x => typeof x === 'string' && x.trim()).join(', ');
+    if (typeof v !== 'string' || !v.trim() || v.length > MAX_ANSWER) return null;
+    out[key] = v;
+  }
+  return out;
+}
+
 class SessionManager extends EventEmitter {
-  constructor() {
+  constructor(opts = {}) {
     super();
     this.sessions = new Map();
     this.pendingPermissions = new Map();
     this.pendingQuestions = new Map();
     this.scannedSessions = [];
     this._requestCounter = 0;
+    this._calls = new Map(); // sessionId -> Map(tool_use_id -> { actor, toolName, inputKey, boundTo, ts })
+    this._recentlyResolved = [];
+    this._lastCompletionTs = new Map();
+    this._transcripts = opts.transcriptWatcher
+      || new TranscriptWatcher((key, toolUseId, m) => this._onTranscriptResult(key, toolUseId, m));
     this._cleanupTimer = setInterval(() => this._cleanupStaleSessions(), 15000);
+    if (this._cleanupTimer.unref) this._cleanupTimer.unref();
   }
 
   handleEvent(event, respond) {
@@ -33,47 +159,50 @@ class SessionManager extends EventEmitter {
 
     switch (eventName) {
       case 'SessionStart':
-        this._onSessionStart(sessionId, event);
+        this._updateSessionStatus(sessionId, 'active');
         break;
       case 'SessionEnd':
         this._onSessionEnd(sessionId);
         break;
       case 'UserPromptSubmit':
-        this._onUserPrompt(sessionId, event);
+        this._settleMainTurn(sessionId, event, 'new-prompt');
+        this._onUserPrompt(sessionId);
         this.emit('sound', 'sessionStart', { sessionId, agent: this.sessions.get(sessionId)?.agent });
         break;
       case 'PreToolUse':
+        this._trackCallStart(sessionId, event);
         this._onPreToolUse(sessionId, event);
         this.emit('sound', 'toolUse', { sessionId, agent: this.sessions.get(sessionId)?.agent });
         break;
       case 'PostToolUse':
+        this._trackCallEnd(sessionId, event, false);
         this._onPostToolUse(sessionId, event, false);
         break;
       case 'PostToolUseFailure':
+        this._trackCallEnd(sessionId, event, true);
         this._onPostToolUse(sessionId, event, true);
         break;
       case 'PermissionRequest':
         this._onPermissionRequest(sessionId, event, respond);
         return;
       case 'PermissionDenied':
-        this._onPermissionDenied(sessionId, event);
+        this._refreshWaitingStatus(sessionId, 'thinking');
         break;
       case 'Notification':
         this._onNotification(sessionId, event, respond);
         return;
       case 'Stop':
-        this._onStop(sessionId, event);
-        // Sound is played by the renderer only when the completion card is actually shown,
-        // so we do NOT emit 'sound' here (it would desync with suppressed cards).
+        this._settleMainTurn(sessionId, event, 'turn-ended');
+        this._onStop(sessionId);
         break;
       case 'SubagentStart':
         this._onSubagentStart(sessionId, event);
         break;
       case 'SubagentStop':
-        this._onSubagentStop(sessionId, event);
+        this._onSubagentStop(sessionId);
         break;
       case 'PreCompact':
-        this._onPreCompact(sessionId, event);
+        this._updateSessionStatus(sessionId, 'compacting');
         break;
       default:
         break;
@@ -87,79 +216,63 @@ class SessionManager extends EventEmitter {
     this.emit('state-changed');
   }
 
-  approvePermission(requestId, behavior, answers) {
+  // Returns { ok, status } where status is accepted | already-settled | invalid | delivery-failed.
+  approvePermission(requestId, behavior, answers, message) {
     const pending = this.pendingPermissions.get(requestId);
-    if (!pending) return;
-    let response;
-    // AskUserQuestion responses MUST include updatedInput.{questions, answers} per Claude's hook
-    // schema (sdk-tools.d.ts: answers keyed by question text -> selected option label).
-    if (pending.questions && behavior === 'allow' && answers) {
-      response = {
-        hookSpecificOutput: {
-          hookEventName: 'PermissionRequest',
-          decision: {
-            behavior: 'allow',
-            updatedInput: { questions: pending.questions, answers }
-          }
-        }
-      };
+    if (!pending) return { ok: false, status: 'already-settled' };
+    let decision;
+    let outcome;
+    if (pending.questions && behavior === 'allow') {
+      const normalized = normalizeAnswers(pending.questions, answers);
+      if (!normalized) return { ok: false, status: 'invalid' };
+      const base = pending.rawInput && typeof pending.rawInput === 'object' ? pending.rawInput : {};
+      decision = { behavior: 'allow', updatedInput: { ...base, questions: pending.questions, answers: normalized } };
+      outcome = 'answered';
     } else if (behavior === 'allow') {
-      response = { hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'allow' } } };
+      decision = { behavior: 'allow' };
+      outcome = 'allowed';
     } else if (behavior === 'always') {
-      response = {
-        hookSpecificOutput: {
-          hookEventName: 'PermissionRequest',
-          decision: {
-            behavior: 'allow',
-            updatedPermissions: [{
-              type: 'addRules',
-              rules: [{ toolName: pending.toolName || '', ruleContent: '*' }],
-              behavior: 'allow',
-              destination: 'session'
-            }]
-          }
-        }
-      };
+      if (!pending.sessionRule) return { ok: false, status: 'invalid' };
+      decision = { behavior: 'allow', updatedPermissions: [pending.sessionRule.update] };
+      outcome = 'allowed';
+    } else if (behavior === 'deny') {
+      decision = { behavior: 'deny' };
+      if (message) decision.message = message;
+      outcome = message ? 'clarify' : 'denied';
     } else {
-      response = { hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'deny' } } };
+      return { ok: false, status: 'invalid' };
     }
-    // try/finally guarantees the pending entry is cleaned up even if respond throws.
-    try {
-      pending.respond(JSON.stringify(response));
-    } catch {}
-    this.pendingPermissions.delete(requestId);
-    this._updateSessionStatus(pending.sessionId, 'thinking');
-    this.emit('state-changed');
+    const response = JSON.stringify({ hookSpecificOutput: { hookEventName: 'PermissionRequest', decision } });
+    const status = this._settlePending(requestId, { response, outcome, reason: 'island' });
+    return { ok: status === 'accepted', status };
   }
 
   answerQuestion(requestId, answer) {
     const pending = this.pendingQuestions.get(requestId);
-    if (!pending) return;
-    const response = {
-      hookSpecificOutput: { hookEventName: 'Notification', answer }
-    };
-    try {
-      pending.respond(JSON.stringify(response));
-    } catch {}
+    if (!pending) return { ok: false, status: 'already-settled' };
+    const response = JSON.stringify({ hookSpecificOutput: { hookEventName: 'Notification', answer } });
     this.pendingQuestions.delete(requestId);
-    this._updateSessionStatus(pending.sessionId, 'thinking');
+    let delivered = false;
+    try { delivered = pending.respond(response) !== false; } catch {}
+    this._pushResolved(requestId, pending.sessionId, 'answered', 'island');
+    this._refreshWaitingStatus(pending.sessionId);
     this.emit('state-changed');
+    return { ok: delivered, status: delivered ? 'accepted' : 'delivery-failed' };
   }
 
-  // Called by hookServer when the bridge disconnects; cleans up the matching pending entry.
+  // Called by hookServer when the bridge connection drops before we answered.
   cancelPendingByRespond(respondFn) {
     for (const [id, p] of this.pendingPermissions) {
       if (p.respond === respondFn) {
-        this.pendingPermissions.delete(id);
-        this._updateSessionStatus(p.sessionId, 'thinking');
-        this.emit('state-changed');
+        this._settlePending(id, { response: null, outcome: 'ended', reason: 'disconnect' });
         return;
       }
     }
     for (const [id, q] of this.pendingQuestions) {
       if (q.respond === respondFn) {
         this.pendingQuestions.delete(id);
-        this._updateSessionStatus(q.sessionId, 'thinking');
+        this._pushResolved(id, q.sessionId, 'ended', 'disconnect');
+        this._refreshWaitingStatus(q.sessionId);
         this.emit('state-changed');
         return;
       }
@@ -171,7 +284,6 @@ class SessionManager extends EventEmitter {
     const hookSessionIds = new Set(hookSessions.map(s => s.id));
     const scanOnly = (this.scannedSessions || []).filter(s => !hookSessionIds.has(s.id));
 
-
     const mergedHook = hookSessions.map(hs => {
       const scanned = (this.scannedSessions || []).find(s => s.id === hs.id);
       // A hook session that's seen events recently proves its CLI process is alive — bridge.js is
@@ -181,21 +293,17 @@ class SessionManager extends EventEmitter {
         return {
           ...scanned,
           ...hs,
-          // Fields where the hook data wins (live runtime state).
           status: hs.status,
           currentTool: hs.currentTool,
           toolInput: hs.toolInput,
           lastError: hs.lastError,
-          // Fields where scanner data wins (static metadata).
           name: scanned.name || hs.name || '',
           model: scanned.model || hs.model || '',
+          gitBranch: scanned.gitBranch || '',
           lastPrompt: scanned.lastPrompt || hs.lastPrompt || '',
           lastResponse: scanned.lastResponse || hs.lastResponse || '',
           timeAgo: this._formatTimeAgo(Math.max(hs.lastActivity || 0, scanned.lastActivityAt || 0)),
-          // Scanner reads pid from ~/.claude/sessions/{pid}.json — that's the real claude.exe PID.
-          // hs.pid comes from bridge_ppid, which on Windows can be a short-lived shell wrapper
-          // that's already exited by the time the user clicks (procMap won't have it -> "No ancestors").
-          // Scanner's dedup already picks the alive pidfile, so its pid is trustworthy.
+          // Scanner pid is the real CLI; bridge_ppid may be a shell wrapper that has already exited.
           pid: scanned.pid || hs.pid,
           isRunning: hookRecentlyActive ? true : (scanned.isRunning !== undefined ? scanned.isRunning : true),
           projectName: scanned.projectName || ''
@@ -204,7 +312,6 @@ class SessionManager extends EventEmitter {
       return { ...hs, timeAgo: this._formatTimeAgo(hs.lastActivity) };
     });
 
-    // Recalculate timeAgo for scan-only sessions (scanner caches it at scan time, not query time).
     const scanOnlyFresh = scanOnly.map(s => ({
       ...s,
       timeAgo: this._formatTimeAgo(s.lastActivityAt || s.startedAt)
@@ -213,47 +320,154 @@ class SessionManager extends EventEmitter {
     const allSessions = [...mergedHook, ...scanOnlyFresh].sort((a, b) => {
       if (a.isRunning === false && b.isRunning !== false) return 1;
       if (a.isRunning !== false && b.isRunning === false) return -1;
-      // Sort by last activity (most recent first), fallback to startedAt.
       const aTime = a.lastActivity || a.lastActivityAt || a.startedAt || 0;
       const bTime = b.lastActivity || b.lastActivityAt || b.startedAt || 0;
       return bTime - aTime;
     });
 
+    const now = Date.now();
+    this._recentlyResolved = this._recentlyResolved.filter(r => now - r.at < RESOLVED_KEEP_MS);
+
     return {
       sessions: allSessions,
       pendingPermissions: Array.from(this.pendingPermissions.entries()).map(([id, p]) => ({
         id, sessionId: p.sessionId, toolName: p.toolName, toolInput: p.toolInput,
-        questions: p.questions || null, // AskUserQuestion: raw questions array for rich rendering
+        display: p.display,
+        questions: p.questions || null,
+        alwaysLabel: p.sessionRule ? p.sessionRule.label : null,
+        isSubagent: p.actor !== 'main',
         timestamp: p.timestamp
       })),
       pendingQuestions: Array.from(this.pendingQuestions.entries()).map(([id, q]) => ({
         id, sessionId: q.sessionId, question: q.question, timestamp: q.timestamp
-      }))
+      })),
+      recentlyResolved: this._recentlyResolved.slice()
     };
   }
 
   destroy() {
     clearInterval(this._cleanupTimer);
-    for (const [id, p] of this.pendingPermissions) {
-      try {
-        p.respond(JSON.stringify({
-          hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'deny' } }
-        }));
-      } catch {}
+    for (const id of Array.from(this.pendingPermissions.keys())) {
+      this._settlePending(id, { response: DENY, outcome: 'ended', reason: 'shutdown', silent: true });
     }
-    this.pendingPermissions.clear();
-    for (const [id, q] of this.pendingQuestions) {
+    for (const [, q] of this.pendingQuestions) {
       try { q.respond('{}'); } catch {}
     }
     this.pendingQuestions.clear();
+    this._transcripts.stop();
   }
 
-  // ========== Internal event handlers ==========
+  // ========== Pending lifecycle ==========
+
+  // Single exit for every pending permission: responds at most once, then re-derives the session status.
+  _settlePending(id, { response, outcome, reason, silent }) {
+    const p = this.pendingPermissions.get(id);
+    if (!p) return 'already-settled';
+    this.pendingPermissions.delete(id);
+    // A call id is consumed once its card settles; reusing it could bind a later identical request wrongly.
+    if (p.binding.toolUseId) {
+      const call = this._calls.get(p.sessionId)?.get(p.binding.toolUseId);
+      if (call && call.boundTo === id) call.consumed = true;
+    }
+    this._transcripts.unwatch(id);
+    let delivered = true;
+    if (response !== null) {
+      try { delivered = p.respond(response) !== false; } catch { delivered = false; }
+    }
+    debugLog('perm', `settled id=${id} outcome=${outcome} reason=${reason} delivered=${delivered} binding=${p.binding.state}`);
+    if (silent) return delivered ? 'accepted' : 'delivery-failed';
+    this._pushResolved(id, p.sessionId, outcome, reason);
+    this._refreshWaitingStatus(p.sessionId);
+    this.emit('state-changed');
+    return delivered ? 'accepted' : 'delivery-failed';
+  }
+
+  _pushResolved(id, sessionId, outcome, reason) {
+    this._recentlyResolved.push({ id, sessionId, outcome, reason, at: Date.now() });
+    if (this._recentlyResolved.length > 50) this._recentlyResolved.shift();
+  }
+
+  _refreshWaitingStatus(sessionId, fallback = 'thinking') {
+    const s = this.sessions.get(sessionId);
+    if (!s) return;
+    const hasPerm = Array.from(this.pendingPermissions.values()).some(p => p.sessionId === sessionId);
+    const hasQuestion = Array.from(this.pendingQuestions.values()).some(q => q.sessionId === sessionId);
+    if (hasPerm) s.status = 'waiting_permission';
+    else if (hasQuestion) s.status = 'waiting_answer';
+    else if (s.status === 'waiting_permission' || s.status === 'waiting_answer') s.status = fallback;
+  }
 
   _isWaiting(sessionId) {
     const s = this.sessions.get(sessionId);
     return s && (s.status === 'waiting_permission' || s.status === 'waiting_answer');
   }
+
+  // ========== Call correlation ==========
+
+  _trackCallStart(sessionId, event) {
+    const id = event.tool_use_id;
+    if (!id || typeof id !== 'string') return;
+    let calls = this._calls.get(sessionId);
+    if (!calls) { calls = new Map(); this._calls.set(sessionId, calls); }
+    calls.set(id, {
+      actor: actorOf(event),
+      toolName: event.tool_name || '',
+      inputKey: inputKeyOf(event.tool_input),
+      boundTo: null,
+      consumed: false,
+      ts: Date.now()
+    });
+    while (calls.size > MAX_CALLS_PER_SESSION) calls.delete(calls.keys().next().value);
+  }
+
+  // A finished call proves its permission was decided elsewhere, so the bound card can be retired.
+  _trackCallEnd(sessionId, event, isFailure) {
+    const id = event.tool_use_id;
+    const calls = this._calls.get(sessionId);
+    if (!id || !calls) return;
+    const call = calls.get(id);
+    calls.delete(id);
+    if (call && call.boundTo && !call.consumed) {
+      this._settlePending(call.boundTo, { response: NO_DECISION, outcome: isFailure ? 'failed' : 'executed', reason: 'tool-finished' });
+    }
+  }
+
+  // Binds only when exactly one unbound in-flight call matches; PreToolUse always lands before its PermissionRequest.
+  _bindPending(requestId, sessionId, actor, toolName, inputKey) {
+    const calls = this._calls.get(sessionId);
+    if (!calls) return { state: 'unbound', toolUseId: null };
+    const candidates = [];
+    for (const [toolUseId, c] of calls) {
+      if (!c.boundTo && !c.consumed && c.actor === actor && c.toolName === toolName && c.inputKey === inputKey) candidates.push(toolUseId);
+    }
+    if (candidates.length !== 1) return { state: candidates.length ? 'ambiguous' : 'unbound', toolUseId: null };
+    calls.get(candidates[0]).boundTo = requestId;
+    return { state: 'confirmed', toolUseId: candidates[0] };
+  }
+
+  _onTranscriptResult(key, toolUseId, m) {
+    const p = this.pendingPermissions.get(key);
+    if (!p || p.binding.toolUseId !== toolUseId) return;
+    this._settlePending(key, { response: NO_DECISION, outcome: m.rejected ? 'rejected' : 'external', reason: 'transcript' });
+  }
+
+  // Claude awaits UserPromptSubmit/Stop hooks, so a main-agent permission still pending here was answered already.
+  _settleMainTurn(sessionId, event, reason) {
+    const calls = this._calls.get(sessionId);
+    if (calls) {
+      for (const [toolUseId, c] of Array.from(calls)) if (c.actor === 'main') calls.delete(toolUseId);
+    }
+    for (const [id, p] of Array.from(this.pendingPermissions)) {
+      if (p.sessionId !== sessionId || p.actor !== 'main') continue;
+      if (event.prompt_id && p.promptId) {
+        if (reason === 'new-prompt' && event.prompt_id === p.promptId) continue;
+        if (reason === 'turn-ended' && event.prompt_id !== p.promptId) continue;
+      }
+      this._settlePending(id, { response: NO_DECISION, outcome: 'external', reason });
+    }
+  }
+
+  // ========== Internal event handlers ==========
 
   _touchSession(sessionId, event) {
     // bridge.js stamps the event with _source ('claude' | 'codex'); prefer that for agent detection.
@@ -283,18 +497,9 @@ class SessionManager extends EventEmitter {
     if (event.bridge_ppid && !session.pid) session.pid = event.bridge_ppid;
   }
 
-  _onSessionStart(sessionId, event) {
-    this._updateSessionStatus(sessionId, 'active');
-  }
-
   _onSessionEnd(sessionId) {
-    for (const [id, p] of this.pendingPermissions) {
-      if (p.sessionId === sessionId) {
-        try { p.respond(JSON.stringify({
-          hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'deny' } }
-        })); } catch {}
-        this.pendingPermissions.delete(id);
-      }
+    for (const [id, p] of Array.from(this.pendingPermissions)) {
+      if (p.sessionId === sessionId) this._settlePending(id, { response: DENY, outcome: 'ended', reason: 'session-end' });
     }
     for (const [id, q] of this.pendingQuestions) {
       if (q.sessionId === sessionId) {
@@ -302,17 +507,20 @@ class SessionManager extends EventEmitter {
         this.pendingQuestions.delete(id);
       }
     }
-    this.sessions.delete(sessionId);
-    if (this._lastCompletionTs) this._lastCompletionTs.delete(sessionId);
+    this._dropSession(sessionId);
     this.emit('state-changed');
   }
 
-  _onUserPrompt(sessionId, event) {
+  _dropSession(sessionId) {
+    this.sessions.delete(sessionId);
+    this._calls.delete(sessionId);
+    this._lastCompletionTs.delete(sessionId);
+  }
+
+  _onUserPrompt(sessionId) {
     const session = this.sessions.get(sessionId);
     if (session) {
-      if (!this._isWaiting(sessionId)) {
-        session.status = 'thinking';
-      }
+      if (!this._isWaiting(sessionId)) session.status = 'thinking';
       session.currentTool = null;
       session.toolInput = null;
     }
@@ -324,9 +532,7 @@ class SessionManager extends EventEmitter {
     const session = this.sessions.get(sessionId);
     if (session) {
       session.currentTool = toolName;
-      if (!this._isWaiting(sessionId)) {
-        session.status = 'tool_use';
-      }
+      if (!this._isWaiting(sessionId)) session.status = 'tool_use';
       session.toolInput = this._formatToolInput(toolName, event.tool_input);
     }
     this.emit('state-changed');
@@ -337,21 +543,15 @@ class SessionManager extends EventEmitter {
     if (session) {
       session.currentTool = null;
       session.toolInput = null;
-      if (!this._isWaiting(sessionId)) {
-        session.status = 'thinking';
-      }
-      if (isFailure) {
-        session.lastError = event.error || event.message || 'Tool failed';
-      } else {
-        delete session.lastError;
-      }
+      if (!this._isWaiting(sessionId)) session.status = 'thinking';
+      if (isFailure) session.lastError = event.error || event.message || 'Tool failed';
+      else delete session.lastError;
     }
     this.emit('state-changed');
   }
 
   _onPermissionRequest(sessionId, event, respond) {
     const toolName = event.tool_name || '';
-    const BUILTIN_AUTO_APPROVE = ['TaskCreate','TaskUpdate','TaskGet','TaskList','TaskOutput','TaskStop','TodoRead','TodoWrite','EnterPlanMode','ExitPlanMode'];
     const userApprove = config.get('autoApproveTools') || [];
 
     if (BUILTIN_AUTO_APPROVE.includes(toolName) || userApprove.includes(toolName)) {
@@ -364,36 +564,40 @@ class SessionManager extends EventEmitter {
     }
 
     const requestId = `perm_${++this._requestCounter}`;
-    // AskUserQuestion needs the raw questions array preserved so the renderer can show options
-    // and so approvePermission can echo them back inside updatedInput (required by Claude).
+    const actor = actorOf(event);
+    const rawInput = event.tool_input && typeof event.tool_input === 'object' ? event.tool_input : null;
     const isAskUser = toolName === 'AskUserQuestion';
-    const questions = isAskUser && event.tool_input && Array.isArray(event.tool_input.questions)
-      ? event.tool_input.questions : null;
+    const questions = isAskUser && rawInput && Array.isArray(rawInput.questions) ? rawInput.questions : null;
+    const session = this.sessions.get(sessionId);
+    const binding = this._bindPending(requestId, sessionId, actor, toolName, inputKeyOf(event.tool_input));
+
     this.pendingPermissions.set(requestId, {
-      sessionId, toolName,
+      sessionId, toolName, actor,
       toolInput: this._formatToolInput(toolName, event.tool_input),
+      display: buildDisplay(toolName, rawInput || event.tool_input, session ? session.cwd : event.cwd),
+      rawInput,
       questions,
+      sessionRule: isAskUser ? null : pickSessionRule(event.permission_suggestions),
+      promptId: event.prompt_id || null,
+      binding,
       timestamp: Date.now(),
-      respond: respond || (() => {})
+      respond: respond || (() => false)
     });
 
-    this._updateSessionStatus(sessionId, 'waiting_permission');
-    // Sound is played by the renderer only when the permission card is actually rendered.
-    this.emit('state-changed');
-  }
+    // Transcript records only cover the main conversation unless the event names the subagent's own file.
+    if (binding.state === 'confirmed' && event._source === 'claude') {
+      const transcriptPath = actor === 'main' ? event.transcript_path : event.agent_transcript_path;
+      if (transcriptPath) this._transcripts.watch(requestId, transcriptPath, binding.toolUseId);
+    }
 
-  _onPermissionDenied(sessionId, event) {
-    this._updateSessionStatus(sessionId, 'thinking');
+    debugLog('perm', `received id=${requestId} sid=${sessionId} tool=${toolName} actor=${actor === 'main' ? 'main' : 'sub'} binding=${binding.state} req=${event.bridge_request_id || '-'}`);
+    this._refreshWaitingStatus(sessionId);
+    this.emit('state-changed');
   }
 
   _onNotification(sessionId, event, respond) {
     const question = event.message || event.notification || event.content || event.question || '';
-    // Claude CLI uses its own terminal TUI for any real question requiring user input. The
-    // Notification hook is fired for idle pings ("Claude is waiting for your input"), tool-result
-    // announcements, etc. — none of which we should surface as a blocking question card. If we
-    // kept any of them, the card would re-expand on every state-changed tick until TTL cleans up.
-    // Drop all Claude Notifications here; Codex Notifications (if they ever arrive) still flow
-    // through below.
+    // Claude's Notification hook only carries idle pings; real questions arrive as AskUserQuestion permissions.
     if (event._source === 'claude') {
       if (respond) respond('{}');
       return;
@@ -405,21 +609,19 @@ class SessionManager extends EventEmitter {
     const requestId = `q_${++this._requestCounter}`;
     this.pendingQuestions.set(requestId, {
       sessionId, question, timestamp: Date.now(),
-      respond: respond || (() => {})
+      respond: respond || (() => false)
     });
-    this._updateSessionStatus(sessionId, 'waiting_answer');
-    // Sound is played by the renderer only when the question card is actually rendered.
+    this._refreshWaitingStatus(sessionId);
     this.emit('state-changed');
   }
 
-  _onStop(sessionId, event) {
+  _onStop(sessionId) {
     this._updateSessionStatus(sessionId, 'idle');
     this._emitCompletion(sessionId);
   }
 
   _emitCompletion(sessionId) {
     // Merge duplicate Stop events within 1 second for the same session (e.g. cascading SubagentStop events).
-    if (!this._lastCompletionTs) this._lastCompletionTs = new Map();
     const now = Date.now();
     const last = this._lastCompletionTs.get(sessionId) || 0;
     if (now - last < 1000) return;
@@ -429,36 +631,26 @@ class SessionManager extends EventEmitter {
     const scanned = (this.scannedSessions || []).find(s => s.id === sessionId) || {};
     const cwd = session.cwd || scanned.cwd || '';
 
-    // Suppress completion for Codex sessions spawned by Claude via /codex plugin.
-    // If there's an active Claude session with the same cwd, this Codex session is
-    // just an intermediate step — the user cares about Claude's completion, not Codex's.
+    // Codex in the same cwd as an active Claude session is usually Claude's /codex helper, so it stays quiet.
     const detectedAgent = session.agent || scanned.agent;
     if (detectedAgent === 'codex' && cwd) {
-      // Only suppress if the sibling Claude session is actually active — a long-idle sibling
-      // shouldn't claim parenthood over this Codex completion. Consider it active if we've seen
-      // any hook event from it within the last 2 minutes.
       const CLAUDE_ACTIVE_WINDOW_MS = 2 * 60 * 1000;
-      const nowTs = Date.now();
       for (const [, s] of this.sessions) {
         if (s.id !== sessionId && s.agent === 'claude' && s.cwd === cwd
-            && s.lastActivity && (nowTs - s.lastActivity) < CLAUDE_ACTIVE_WINDOW_MS) {
-          try { require('fs').appendFile(require('path').join(require('os').homedir(), '.codepeek', 'debug.log'),
-            `${new Date().toISOString()} [emit] SUPPRESS codex completion (active Claude parent) sid=${sessionId} cwd=${cwd}\n`, () => {}); } catch {}
+            && s.lastActivity && (now - s.lastActivity) < CLAUDE_ACTIVE_WINDOW_MS) {
+          debugLog('emit', `SUPPRESS codex completion (active Claude parent) sid=${sessionId}`);
           return;
         }
       }
-      try { require('fs').appendFile(require('path').join(require('os').homedir(), '.codepeek', 'debug.log'),
-        `${new Date().toISOString()} [emit] NOT SUPPRESSED codex sid=${sessionId} cwd=${cwd} activeSessions=${Array.from(this.sessions.values()).map(x => x.agent+':'+(x.cwd||'')).join(' | ')}\n`, () => {}); } catch {}
     }
     const projectName = scanned.projectName || (cwd ? cwd.split(/[\\/]/).filter(Boolean).pop() : '') || '';
-    const sessionTitle = scanned.name || session.name || '';
-    const lastResponse = scanned.lastResponse || session.lastResponse || '';
     this.emit('completion', {
       sessionId,
       projectName,
-      sessionTitle,
+      sessionTitle: scanned.name || session.name || '',
+      gitBranch: scanned.gitBranch || '',
       cwd,
-      lastResponse,
+      lastResponse: scanned.lastResponse || session.lastResponse || '',
       agent: session.agent || scanned.agent || 'claude',
       timestamp: now
     });
@@ -468,26 +660,22 @@ class SessionManager extends EventEmitter {
     const session = this.sessions.get(sessionId);
     if (session) {
       session.subagentDepth = (session.subagentDepth || 0) + 1;
-      session.status = 'subagent';
-      session.statusDetail = event.subagent_type || 'agent';
+      if (!this._isWaiting(sessionId)) session.status = 'subagent';
+      session.statusDetail = event.subagent_type || event.agent_type || 'agent';
     }
     this.emit('state-changed');
   }
 
-  _onSubagentStop(sessionId, event) {
+  _onSubagentStop(sessionId) {
     const session = this.sessions.get(sessionId);
     if (session) {
       session.subagentDepth = Math.max(0, (session.subagentDepth || 1) - 1);
       if (session.subagentDepth === 0) {
-        session.status = 'thinking';
+        if (!this._isWaiting(sessionId)) session.status = 'thinking';
         delete session.statusDetail;
       }
     }
     this.emit('state-changed');
-  }
-
-  _onPreCompact(sessionId, event) {
-    this._updateSessionStatus(sessionId, 'compacting');
   }
 
   _updateSessionStatus(sessionId, status, detail) {
@@ -496,6 +684,7 @@ class SessionManager extends EventEmitter {
       session.status = status;
       if (detail) session.statusDetail = detail;
       else delete session.statusDetail;
+      this._refreshWaitingStatus(sessionId, status);
     }
     this.emit('state-changed');
   }
@@ -558,24 +747,22 @@ class SessionManager extends EventEmitter {
 
   _cleanupStaleSessions() {
     const timeout = getSessionTimeout();
-    if (timeout <= 0) return;
     const now = Date.now();
-    for (const [id, session] of this.sessions) {
-      if (now - session.lastActivity > timeout) {
-        this.sessions.delete(id);
+    if (timeout > 0) {
+      for (const [id, session] of this.sessions) {
+        if (now - session.lastActivity <= timeout) continue;
+        const hasPending = Array.from(this.pendingPermissions.values()).some(p => p.sessionId === id)
+          || Array.from(this.pendingQuestions.values()).some(q => q.sessionId === id);
+        if (hasPending) continue;
+        this._dropSession(id);
       }
     }
-    // Also age out pending permissions/questions. bridge.js blocks for up to 24h waiting
-    // for a response; if the user hasn't seen or answered the card within 10 minutes,
-    // it's almost certainly orphaned (session ended silently, UI got shadowed, etc.)
-    // and would otherwise hang the "question" surface forever.
-    const PENDING_TTL = 10 * 60 * 1000;
-    for (const [id, p] of this.pendingPermissions) {
+    // bridge.js can block for 24h; an unanswered card after 10 minutes is almost certainly orphaned.
+    for (const [id, p] of Array.from(this.pendingPermissions)) {
       if (p.timestamp && now - p.timestamp > PENDING_TTL) {
-        try { p.respond(JSON.stringify({
-          hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'deny' } }
-        })); } catch {}
-        this.pendingPermissions.delete(id);
+        const response = JSON.stringify({ hookSpecificOutput: { hookEventName: 'PermissionRequest',
+          decision: { behavior: 'deny', message: 'CodePeek: no answer within 10 minutes.' } } });
+        this._settlePending(id, { response, outcome: 'expired', reason: 'ttl' });
       }
     }
     for (const [id, q] of this.pendingQuestions) {
@@ -597,8 +784,7 @@ class SessionManager extends EventEmitter {
       const gone = !procMap.has(session.pid);
       const orphan = orphanedPids && orphanedPids.has(session.pid);
       if (gone || orphan) {
-        this.sessions.delete(id);
-        if (this._lastCompletionTs) this._lastCompletionTs.delete(id);
+        this._dropSession(id);
         removed++;
       }
     }
@@ -608,3 +794,7 @@ class SessionManager extends EventEmitter {
 }
 
 module.exports = SessionManager;
+module.exports.inputKeyOf = inputKeyOf;
+module.exports.normalizeAnswers = normalizeAnswers;
+module.exports.pickSessionRule = pickSessionRule;
+module.exports.buildDisplay = buildDisplay;

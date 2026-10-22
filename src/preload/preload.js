@@ -12,10 +12,11 @@ contextBridge.exposeInMainWorld('codePeek', {
   getSounds: () => ipcRenderer.invoke('get-sounds'),
   getSoundPacks: () => ipcRenderer.invoke('get-sound-packs'),
   getDisplays: () => ipcRenderer.invoke('get-displays'),
+  getAccentColor: () => ipcRenderer.invoke('get-accent-color'),
 
   // Actions
-  approvePermission: (requestId, behavior, answers) =>
-    ipcRenderer.invoke('approve-permission', requestId, behavior, answers),
+  approvePermission: (requestId, behavior, answers, message) =>
+    ipcRenderer.invoke('approve-permission', requestId, behavior, answers, message),
   answerQuestion: (requestId, answer) =>
     ipcRenderer.invoke('answer-question', requestId, answer),
 
@@ -31,8 +32,9 @@ contextBridge.exposeInMainWorld('codePeek', {
   installAllHooks: () => ipcRenderer.invoke('install-all-hooks'),
 
   // Window
-  resizeWindow: (params) => ipcRenderer.invoke('resize-window', params),
   setIgnoreMouse: (ignore) => ipcRenderer.invoke('set-ignore-mouse', ignore),
+  dragWindow: (dx) => ipcRenderer.invoke('drag-window', dx),
+  focusWindow: () => ipcRenderer.invoke('focus-window'),
   quitApp: () => ipcRenderer.invoke('quit-app'),
   jumpToTerminal: (pid, sessionName, cwd) => ipcRenderer.invoke('jump-to-terminal', pid, sessionName, cwd),
   launchSession: (sessionId, cwd, agent) => ipcRenderer.invoke('launch-session', sessionId, cwd, agent),
@@ -76,6 +78,11 @@ contextBridge.exposeInMainWorld('codePeek', {
     const h = (_, data) => cb(data);
     ipcRenderer.on('notification', h);
     return () => ipcRenderer.removeListener('notification', h);
+  },
+  onAccentChanged: (cb) => {
+    const h = (_, color) => cb(color);
+    ipcRenderer.on('accent-changed', h);
+    return () => ipcRenderer.removeListener('accent-changed', h);
   },
   onCompletionNotify: (cb) => {
     const h = (_, data) => cb(data);

@@ -1,49 +1,389 @@
 'use strict';
 
 // ========== DOM references ==========
-const island = document.getElementById('island');
-const header = document.getElementById('header');
-const content = document.getElementById('content');
-const mascot = document.getElementById('mascot');
-const statusDot = document.getElementById('statusDot');
-const titleText = document.getElementById('titleText');
-const headerStats = document.getElementById('headerStats');
-const btnSettings = document.getElementById('btnSettings');
-const btnCollapse = document.getElementById('btnCollapse');
-const sessionsList = document.getElementById('sessionsList');
-const sessionsSection = document.getElementById('sessionsSection');
-const sessionsTitle = document.getElementById('sessionsTitle');
-const permissionsList = document.getElementById('permissionsList');
-const permissionsSection = document.getElementById('permissionsSection');
-const permissionsTitle = document.getElementById('permissionsTitle');
-const questionsList = document.getElementById('questionsList');
-const questionsSection = document.getElementById('questionsSection');
-const questionsTitle = document.getElementById('questionsTitle');
-const completionSection = document.getElementById('completionSection');
-const completionBody = document.getElementById('completionBody');
-const completionTitle = document.getElementById('completionTitle');
-const settingsModal = document.getElementById('settingsModal');
-const btnSettingsClose = document.getElementById('btnSettingsClose');
-const audio = document.getElementById('audio');
+const $ = (id) => document.getElementById(id);
+const island = $('island');
+const panel = $('panel');
+const content = $('content');
+const indicator = $('indicator');
+const stripHit = $('stripHit');
+const strip = $('strip');
+const pill = $('pill');
+const pillMascot = $('pillMascot');
+const pillText = $('pillText');
+const pillBadge = $('pillBadge');
+const pillTime = $('pillTime');
+const header = $('header');
+const hdrMain = $('hdrMain');
+const statusDot = $('statusDot');
+const headerStats = $('headerStats');
+const groupTabs = $('groupTabs');
+const btnBack = $('btnBack');
+const btnMute = $('btnMute');
+const btnPin = $('btnPin');
+const btnSettings = $('btnSettings');
+const btnCollapse = $('btnCollapse');
+const pendingBanner = $('pendingBanner');
+const sessionsList = $('sessionsList');
+const permissionsList = $('permissionsList');
+const questionsList = $('questionsList');
+const completionBody = $('completionBody');
+const toastEl = $('toast');
+const audio = $('audio');
+const SECTIONS = {
+  list: $('sessionsSection'),
+  approval: $('permissionsSection'),
+  question: $('questionsSection'),
+  completion: $('completionSection'),
+  settings: $('settingsSection')
+};
 
-// Sizes
-const COLLAPSED_WIDTH = 360;
-const COLLAPSED_HEIGHT = 48;
+const DEFAULT_ACCENT = '#4CC2FF';
+// Fluent decelerate/accelerate tokens for "snappy"; a gentler ease-out/ease-in pair for "smooth".
+const EASINGS = {
+  snappy: ['cubic-bezier(0.1, 0.9, 0.2, 1)', 'cubic-bezier(0.9, 0.1, 1, 0.2)'],
+  smooth: ['cubic-bezier(0.33, 0, 0.1, 1)', 'cubic-bezier(0.4, 0, 0.8, 0.4)']
+};
+const EXIT_LOCAL_MS = 450;
+const EXIT_EXTERNAL_MS = 900;
+const TOOL_LINGER_MS = 2000;
+const COMPLETION_THROTTLE_MS = 5000;
+const INPUT_ACTIVE_MS = 2000;
 
-// State
-let isExpanded = false;
-let currentState = { sessions: [], pendingPermissions: [], pendingQuestions: [] };
+// ========== State ==========
+let currentState = { sessions: [], pendingPermissions: [], pendingQuestions: [], recentlyResolved: [] };
 let currentConfig = {};
 let currentDict = {};
 let currentAgents = [];
 let currentSounds = {};
 let currentDisplays = [];
-let selectedSessionId = null;
-let _lastToolBySession = new Map(); // sessionId -> { tool, input, fadeTimer, timestamp }
-let _startupAnimActive = false;
-let _dragState = null; // { startX, startOffsetX }
+let accentColor = null;
+let hooksInstalled = true;
+let reducedMotion = false;
 
-// Hover timing - delays are read from config with sensible defaults.
+const ui = {
+  expanded: false,
+  expandedBy: null, // hover | click | event | settings
+  pinned: false,
+  surface: 'list',
+  settingsOpen: false,
+  animSeq: 0,
+  animating: false,
+  renderQueued: false
+};
+
+// Request ids the user collapsed away: they stop auto-expanding but stay reachable from the pill.
+const snoozed = new Set();
+const seenRequests = new Set();
+// id -> local outcome while our own IPC submit is in flight.
+const submitting = new Map();
+// id -> { el, surface, timer } while a resolved card plays its exit.
+const exiting = new Map();
+// Request cards are cached by id so AskUserQuestion drafts survive re-renders.
+const requestCards = new Map();
+const sessionCards = new Map();
+const groupHeaders = new Map();
+const lastToolBySession = new Map();
+const foldedGroups = new Set(['ended']);
+
+let completion = null; // { data, timer }
+let completionBadge = 0;
+let lastCompletionShownAt = 0;
+let lastKeyAt = 0;
+let mouseInIsland = false;
+let composing = false;
+let hoverExpandTimer = null;
+let hoverCollapseTimer = null;
+// Last rendered list layout (order, group of each id, group order); reused while the cursor is over the list.
+let lastLayout = null;
+let emptyNode = null;
+let selectedSessionId = null;
+
+const t = (key, fallback) => (currentDict && currentDict[key]) || fallback || key;
+const fmt = (key, vars, fallback) => t(key, fallback).replace(/\{(\w+)\}/g, (_, k) => (vars[k] !== undefined ? vars[k] : ''));
+const uiLog = (msg) => console.log('[ui] ' + msg);
+
+function el(tag, cls, text) {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text !== undefined && text !== null) n.textContent = String(text);
+  return n;
+}
+function icon(code, cls) {
+  const n = el('span', 'ico' + (cls ? ' ' + cls : ''));
+  n.textContent = String.fromCharCode(parseInt(code, 16));
+  return n;
+}
+
+// ========== Init ==========
+async function init() {
+  [currentConfig, currentDict, currentAgents, currentSounds, currentDisplays, currentState, accentColor, hooksInstalled] = await Promise.all([
+    window.codePeek.getConfig(),
+    window.codePeek.getDict(),
+    window.codePeek.getAgents(),
+    window.codePeek.getSounds(),
+    window.codePeek.getDisplays(),
+    window.codePeek.getState(),
+    window.codePeek.getAccentColor().catch(() => null),
+    window.codePeek.isHooksInstalled().catch(() => true)
+  ]);
+  currentState = normalizeState(currentState);
+  for (const p of currentState.pendingPermissions) seenRequests.add(p.id);
+  for (const q of currentState.pendingQuestions) seenRequests.add(q.id);
+
+  applyConfigToUI();
+  applyI18n();
+  reconcile();
+  renderNow();
+
+  window.codePeek.onStateChanged(handleState);
+  window.codePeek.onConfigChanged(async (cfg) => {
+    const langChanged = cfg.language !== currentConfig.language;
+    currentConfig = cfg;
+    if (langChanged) currentDict = await window.codePeek.getDict();
+    applyConfigToUI();
+    applyI18n();
+    sessionCards.forEach(c => { c.fp = ''; });
+    render();
+  });
+  window.codePeek.onPlaySound(type => playSound(type));
+  window.codePeek.onSoundsChanged(sounds => { currentSounds = sounds; });
+  window.codePeek.onCollapse(() => userCollapse('main'));
+  window.codePeek.onCompletionNotify(data => handleCompletion(data));
+  window.codePeek.onAccentChanged(color => { accentColor = color; applyAccent(); });
+
+  const mq = window.matchMedia('(prefers-reduced-motion: reduce)');
+  mq.addEventListener('change', applyMotionPreference);
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) MascotClock.pause(); else MascotClock.resume();
+  });
+  window.addEventListener('keydown', onKeyDown, true);
+  document.addEventListener('compositionstart', () => { composing = true; }, true);
+  document.addEventListener('compositionend', () => { composing = false; }, true);
+
+  setInterval(tickClocks, 1000);
+  setInterval(safetyPoll, 200);
+
+  // Brief hover-style cue so the user can see where the island lives after launch.
+  setTimeout(() => {
+    const target = stripHit.offsetParent ? stripHit : pill;
+    target.classList.add('prehover');
+    setTimeout(() => target.classList.remove('prehover'), 900);
+  }, 600);
+}
+
+function normalizeState(s) {
+  return {
+    sessions: (s && s.sessions) || [],
+    pendingPermissions: (s && s.pendingPermissions) || [],
+    pendingQuestions: (s && s.pendingQuestions) || [],
+    recentlyResolved: (s && s.recentlyResolved) || []
+  };
+}
+
+// ========== State intake ==========
+function handleState(state) {
+  const prevIds = new Set([...currentState.pendingPermissions, ...currentState.pendingQuestions].map(x => x.id));
+  currentState = normalizeState(state);
+  const liveIds = new Set([...currentState.pendingPermissions, ...currentState.pendingQuestions].map(x => x.id));
+
+  for (const id of prevIds) {
+    if (!liveIds.has(id)) startExit(id);
+  }
+  for (const id of liveIds) {
+    if (!seenRequests.has(id)) {
+      seenRequests.add(id);
+      playSound(id.startsWith('q_') ? 'question' : 'permission');
+    }
+  }
+  for (const id of Array.from(snoozed)) if (!liveIds.has(id)) snoozed.delete(id);
+  for (const id of Array.from(requestCards.keys())) {
+    if (!liveIds.has(id) && !exiting.has(id)) requestCards.delete(id);
+  }
+  reconcile();
+}
+
+function livePerms() { return currentState.pendingPermissions; }
+function liveQuestions() { return currentState.pendingQuestions; }
+function liveRequests() { return [...livePerms(), ...liveQuestions()]; }
+function hasUnsnoozedPending() { return liveRequests().some(r => !snoozed.has(r.id)); }
+function isEditing() {
+  if (composing) return true;
+  const a = document.activeElement;
+  return !!(a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA' || a.tagName === 'SELECT') && island.contains(a));
+}
+
+// ========== Surface state machine ==========
+function computeSurface() {
+  if (ui.settingsOpen) return 'settings';
+  for (const x of exiting.values()) return x.surface;
+  if (livePerms().some(p => !snoozed.has(p.id))) return 'approval';
+  if (liveQuestions().some(q => !snoozed.has(q.id))) return 'question';
+  if (completion) return 'completion';
+  return 'list';
+}
+
+function reconcile() {
+  if (!ui.expanded) {
+    if (hasUnsnoozedPending() || completion) expand('event');
+  } else if (shouldAutoCollapse()) {
+    collapse('event-done');
+    renderIndicator();
+    renderHeader();
+    return;
+  } else if (!mouseInIsland && !hoverCollapseTimer && ui.expandedBy !== 'event') {
+    // A hover/click expansion whose blocking request just resolved: leave via the normal delayed collapse.
+    scheduleCollapse();
+  }
+  setSurface(computeSurface());
+  render();
+}
+
+function shouldAutoCollapse() {
+  return ui.expandedBy === 'event' && !hasUnsnoozedPending() && !completion && exiting.size === 0
+    && !mouseInIsland && !ui.pinned && !ui.settingsOpen && !isEditing();
+}
+
+// The panel's geometry is frozen while it slides; a surface switch requested then is applied afterwards.
+function setSurface(next) {
+  if (ui.animating) { ui.renderQueued = true; return; }
+  const prev = ui.surface;
+  ui.surface = next;
+  island.classList.toggle('surface-settings', next === 'settings');
+  if (prev === next && SECTIONS[next].classList.contains('on')) return;
+  for (const [name, sec] of Object.entries(SECTIONS)) sec.classList.toggle('on', name === next);
+  renderSurface(next);
+  // One layout, then the new content fades in; no per-frame height animation.
+  if (ui.expanded && prev !== next) {
+    const sec = SECTIONS[next];
+    sec.classList.remove('swap-in');
+    void sec.offsetWidth;
+    sec.classList.add('swap-in');
+  }
+}
+
+// ========== Expand / collapse ==========
+function expand(by) {
+  clearTimeout(hoverCollapseTimer);
+  hoverCollapseTimer = null;
+  if (ui.expanded) return;
+  ui.expanded = true;
+  ui.expandedBy = by;
+  uiLog(`expand by=${by}`);
+  const seq = ++ui.animSeq;
+  ui.animating = false;
+  setSurface(computeSurface());
+  renderNow();
+  ui.animating = true;
+  island.classList.add('animating');
+  content.classList.add('entering');
+  island.classList.add('expanded');
+  syncIgnoreMouse();
+  afterTransform(seq, durOpen(), () => {
+    island.classList.remove('animating');
+    content.classList.remove('entering');
+    ui.animating = false;
+    if (ui.renderQueued) { setSurface(computeSurface()); renderNow(); }
+    window.codePeek.refreshSessions();
+  });
+}
+
+function collapse(reason) {
+  clearTimeout(hoverExpandTimer);
+  clearTimeout(hoverCollapseTimer);
+  hoverExpandTimer = null;
+  hoverCollapseTimer = null;
+  if (!ui.expanded) return;
+  ui.expanded = false;
+  ui.expandedBy = null;
+  ui.pinned = false;
+  uiLog(`collapse reason=${reason || '-'}`);
+  if (ui.settingsOpen) closeSettings(true);
+  if (completion) clearCompletion();
+  const seq = ++ui.animSeq;
+  ui.animating = true;
+  island.classList.add('animating');
+  island.classList.remove('expanded');
+  if (document.activeElement && island.contains(document.activeElement)) document.activeElement.blur();
+  syncIgnoreMouse();
+  afterTransform(seq, durClose(), () => {
+    island.classList.remove('animating');
+    ui.animating = false;
+    completionBadge = 0;
+    lastLayout = null;
+    setSurface(computeSurface());
+    renderNow();
+  });
+}
+
+// Runs fn once the panel transform finishes; a newer animation (seq) invalidates older callbacks.
+function afterTransform(seq, duration, fn) {
+  let done = false;
+  const finish = () => {
+    if (done) return;
+    done = true;
+    panel.removeEventListener('transitionend', onEnd);
+    if (seq === ui.animSeq) fn();
+  };
+  const onEnd = (e) => { if (e.target === panel && e.propertyName === 'transform') finish(); };
+  if (reducedMotion) { finish(); return; }
+  panel.addEventListener('transitionend', onEnd);
+  setTimeout(finish, duration + 80);
+}
+
+// Collapsing from a button or Esc snoozes whatever is pending so the next state tick cannot re-open it.
+function userCollapse(source) {
+  for (const r of liveRequests()) snoozed.add(r.id);
+  collapse('user:' + source);
+  renderIndicator();
+  renderHeader();
+}
+
+function openRequests(sessionId) {
+  for (const r of liveRequests()) {
+    if (!sessionId || r.sessionId === sessionId) snoozed.delete(r.id);
+  }
+  if (!ui.expanded) expand('click');
+  reconcile();
+}
+
+function scheduleExpand(by) {
+  if (ui.expanded) { clearTimeout(hoverCollapseTimer); hoverCollapseTimer = null; return; }
+  if (by === 'hover' && !currentConfig.hoverExpand) return;
+  if (hoverExpandTimer) return;
+  const target = indicator.classList.contains('mode-pill') ? pill : stripHit;
+  target.classList.add('prehover');
+  hoverExpandTimer = setTimeout(() => {
+    hoverExpandTimer = null;
+    target.classList.remove('prehover');
+    if (mouseInIsland) expand(by);
+  }, getHoverExpandDelay());
+}
+
+function scheduleCollapse() {
+  clearTimeout(hoverExpandTimer);
+  hoverExpandTimer = null;
+  pill.classList.remove('prehover');
+  stripHit.classList.remove('prehover');
+  if (!ui.expanded) return;
+  if (ui.pinned || ui.settingsOpen || isEditing() || completion) return;
+  if (hasUnsnoozedPending() || exiting.size > 0) return;
+  if (!currentConfig.autoHidePanel) return;
+  clearTimeout(hoverCollapseTimer);
+  hoverCollapseTimer = setTimeout(() => {
+    hoverCollapseTimer = null;
+    if (mouseInIsland || ui.pinned || ui.settingsOpen || isEditing() || hasUnsnoozedPending() || completion) return;
+    collapse('mouse-leave');
+  }, getHoverCollapseDelay());
+}
+
+function durOpen() {
+  const v = Number(currentConfig.animationDuration);
+  return Number.isFinite(v) ? Math.min(800, Math.max(150, v)) : 300;
+}
+function durClose() { return Math.round(durOpen() * 2 / 3); }
+
 function getHoverExpandDelay() {
   const v = currentConfig.hoverExpandDelay;
   return (typeof v === 'number' && v >= 0) ? v : 80;
@@ -52,1187 +392,975 @@ function getHoverCollapseDelay() {
   const v = currentConfig.hoverCollapseDelay;
   return (typeof v === 'number' && v >= 0) ? v : 1500;
 }
-let hoverExpandTimer = null;
-let hoverCollapseTimer = null;
-let manuallyPinned = false;
 
-// ========== Initialization ==========
+// ========== Exit of resolved requests ==========
+const OUTCOME_VIEW = {
+  allowed: ['resAllowed', 'E73E', 'ok'],
+  answered: ['resAnswered', 'E73E', 'ok'],
+  clarify: ['resClarify', 'E8BD', 'neutral'],
+  denied: ['resDenied', 'E711', 'no'],
+  rejected: ['resRejected', 'E711', 'no'],
+  executed: ['resExecuted', 'E73E', 'ok'],
+  failed: ['resExternal', 'E7BA', 'neutral'],
+  external: ['resExternal', 'E73E', 'neutral'],
+  ended: ['resEnded', 'E711', 'neutral'],
+  expired: ['resExpired', 'E916', 'neutral']
+};
 
-async function init() {
-  [currentConfig, currentDict, currentAgents, currentSounds, currentDisplays, currentState] = await Promise.all([
-    window.codePeek.getConfig(),
-    window.codePeek.getDict(),
-    window.codePeek.getAgents(),
-    window.codePeek.getSounds(),
-    window.codePeek.getDisplays(),
-    window.codePeek.getState()
-  ]);
-
-  applyConfigToUI();
-  applyI18n();
-  reconcileSurface();
-  render();
-
-  window.codePeek.onStateChanged(state => {
-    currentState = state;
-    // A state-changed event may introduce/remove approval or question items; recompute surface.
-    reconcileSurface();
-    render();
-  });
-
-  window.codePeek.onConfigChanged(async cfg => {
-    currentConfig = cfg;
-    currentDict = await window.codePeek.getDict();
-    applyConfigToUI();
-    applyI18n();
-    render();
-  });
-
-  window.codePeek.onPlaySound(type => playSound(type));
-  window.codePeek.onSoundsChanged(sounds => { currentSounds = sounds; });
-  window.codePeek.onCollapse(() => collapse());
-  window.codePeek.onNotification(data => showToast(data.message, data.type));
-  window.codePeek.onCompletionNotify(data => handleCompletion(data));
-
-  // Track recent keyboard activity for completion-notification suppression.
-  window.addEventListener('keydown', () => { _lastKeyAt = Date.now(); }, true);
-  // Once the mouse enters the island, the user's intent is clear: do not auto-collapse.
-  island.addEventListener('mouseenter', () => {
-    _mouseOverIsland = true;
-    _autoExpandedByEvent = false;
-  });
-  island.addEventListener('mouseleave', () => { _mouseOverIsland = false; });
-
-  // Startup confirmation animation: briefly expand then collapse to signal "I'm running".
-  setTimeout(() => {
-    if (!isExpanded && !mouseInIsland && currentState.sessions.length === 0) {
-      _startupAnimActive = true;
-      island.classList.add('expanded-state');
-      setTimeout(() => {
-        if (_startupAnimActive && !isExpanded && !mouseInIsland) {
-          island.classList.remove('expanded-state');
-        }
-        _startupAnimActive = false;
-      }, 1200);
-    }
-  }, 500);
-}
-
-// ========== Surface state machine ==========
-// At any moment the island renders exactly one surface.
-// Priority: approval > question > completion > list > peek.
-let _surface = 'peek';
-// Whether the current expansion was triggered by an event (vs. user hover/pin);
-// used to decide whether to auto-collapse once the event surface dismisses.
-let _autoExpandedByEvent = false;
-// Completion single-card state
-let _completionCurrent = null;     // currently displayed completion payload
-let _completionBadgeCount = 0;      // count of completions suppressed/merged into the badge
-let _completionTimer = null;
-let _completionHover = false;
-let _lastCompletionShownAt = 0;
-// Completion suppression signals
-let _lastKeyAt = 0;
-let _mouseOverIsland = false;
-const COMPLETION_AUTO_HIDE_MS = 5000;
-const COMPLETION_THROTTLE_MS = 5000;  // at most one card every 5s; extras go to the badge
-const INPUT_ACTIVE_MS = 2000;         // keyboard activity window considered "user busy"
-
-function setSurface(next) {
-  if (_surface === next) return;
-  _surface = next;
-  if (next === 'peek') {
-    if (!manuallyPinned && !isModalOpen()) collapse();
-  } else {
-    if (!isExpanded) {
-      _autoExpandedByEvent = true; // flag that the expansion was event-driven, not user-driven
-      expand();
-    } else if (EVENT_SURFACES.has(next)) {
-      // Already expanded, so expand() would early-return without cleaning leftover inline styles
-      // from a previous collapse phase 1 (opacity:0, pointer-events:none). If we skip this,
-      // the card renders into a transparent container and the user sees nothing.
-      if (_collapseTimer) { clearTimeout(_collapseTimer); _collapseTimer = null; }
-      content.style.opacity = '';
-      content.style.pointerEvents = '';
-      if (!content.classList.contains('expanded')) content.classList.add('expanded');
-      if (!island.classList.contains('expanded-state')) island.classList.add('expanded-state');
-    }
-    // Nuclear option: make event cards visible *instantly*, no animation. Claude's CLI has its own
-    // terminal TUI approval; users often answer there before our 0.32s expand animation finishes.
-    // When that happens, bridge closes, pendingPermissions clears, and the island collapses —
-    // the user heard the sound but never saw the card. Snapping avoids the race.
-    if (EVENT_SURFACES.has(next)) {
-      content.style.setProperty('opacity', '1', 'important');
-      content.style.setProperty('max-height', '540px', 'important');
-      content.style.setProperty('pointer-events', 'auto', 'important');
-      content.style.setProperty('transition', 'none', 'important');
-      // Force the island out to the fully-expanded transform immediately (no transition).
-      const offsetX = currentConfig.panelOffsetX || 0;
-      const xform = offsetX ? `translateY(-2px) translateX(${offsetX}px)` : 'translateY(-2px)';
-      island.style.setProperty('transform', xform, 'important');
-      island.style.setProperty('transition', 'none', 'important');
-      // Re-enable transitions on next frame AND drop the !important transform so subsequent
-      // user-driven collapse/expand obeys the regular CSS rules. Without removing transform,
-      // the inline !important overrides .island / .island.expanded-state forever and the island
-      // gets stuck at translateY(-2px) — hover collapse/expand silently fails to move it.
-      requestAnimationFrame(() => {
-        content.style.removeProperty('transition');
-        island.style.removeProperty('transition');
-        island.style.removeProperty('transform');
-      });
-    }
-  }
-  // Paint event surfaces synchronously — rAF gets throttled when the peek-small transparent
-  // window has no compositor activity, and the card would never paint.
-  if (EVENT_SURFACES.has(next)) renderNow();
-  else render();
-}
-
-// Recompute the target surface from the current state and completion-display flags.
-const EVENT_SURFACES = new Set(['approval', 'question', 'completion']);
-function reconcileSurface() {
-  // Treat sticky-card states as "still has" so the surface stays on approval/question until the
-  // user dismisses by clicking a button. Claude often self-answers its own prompt in under 500ms
-  // via its terminal TUI, closing the bridge before the user can even register the island
-  // expanded — sticky keeps the info visible until the user actively sees and dismisses.
-  const hasApproval = currentState.pendingPermissions.length > 0 || !!_permStickyCard;
-  const hasQuestion = currentState.pendingQuestions.length > 0 || !!_questionStickyCard;
-  if (hasApproval) { setSurface('approval'); return; }
-  if (hasQuestion) { setSurface('question'); return; }
-  if (_completionCurrent) { setSurface('completion'); return; }
-  // No event cards remaining.
-  if (!isExpanded) { setSurface('peek'); return; }
-  // If the previous surface was an event card, the island was auto-expanded for it.
-  // Collapse back unless the user has pinned or is hovering.
-  if (EVENT_SURFACES.has(_surface) && !manuallyPinned && !_mouseOverIsland) {
-    setSurface('peek');
+function startExit(id) {
+  const local = submitting.get(id);
+  submitting.delete(id);
+  const record = currentState.recentlyResolved.find(r => r.id === id);
+  const outcome = (record && record.outcome) || local || 'ended';
+  const card = requestCards.get(id);
+  const surface = id.startsWith('q_') ? 'question' : 'approval';
+  if (!card || !card.isConnected || !ui.expanded || ui.surface !== surface) {
+    requestCards.delete(id);
     return;
   }
-  if (_autoExpandedByEvent && !manuallyPinned && !_mouseOverIsland) {
-    _autoExpandedByEvent = false;
-    setSurface('peek');
-    return;
+  const view = OUTCOME_VIEW[outcome] || OUTCOME_VIEW.ended;
+  const result = card.querySelector('.result');
+  if (result) {
+    result.innerHTML = '';
+    const res = el('span', 'res ' + view[2]);
+    res.appendChild(icon(view[1]));
+    res.appendChild(document.createTextNode(t(view[0])));
+    result.appendChild(res);
   }
-  setSurface('list');
+  card.classList.add('is-resolved');
+  card.querySelectorAll('button, textarea, input').forEach(b => { b.disabled = true; });
+  const isLocal = record ? record.reason === 'island' : !!local;
+  const timer = setTimeout(() => {
+    exiting.delete(id);
+    requestCards.delete(id);
+    reconcile();
+  }, isLocal ? EXIT_LOCAL_MS : EXIT_EXTERNAL_MS);
+  exiting.set(id, { el: card, surface, timer });
 }
 
-// Completion entry point: merges duplicates, throttles frequency, suppresses during input.
-function handleCompletion(data) {
-  if (!data) { console.log('[completion-debug] no data'); return; }
-  const hasBlocking = currentState.pendingPermissions.length > 0 || currentState.pendingQuestions.length > 0;
-  if (hasBlocking) {
-    console.log('[completion-debug] suppressed: blocking interaction');
-    _completionBadgeCount++;
-    updateCompletionBadge();
-    return;
-  }
-  // Active typing and mouse not on the island: skip the card, bump the badge instead.
-  if (!_mouseOverIsland && (Date.now() - _lastKeyAt) < INPUT_ACTIVE_MS) {
-    console.log('[completion-debug] suppressed: active typing');
-    _completionBadgeCount++;
-    updateCompletionBadge();
-    return;
-  }
-  // Global throttle: at most one card within the throttle window.
-  if (Date.now() - _lastCompletionShownAt < COMPLETION_THROTTLE_MS) {
-    console.log('[completion-debug] suppressed: throttled');
-    _completionBadgeCount++;
-    updateCompletionBadge();
-    return;
-  }
-  console.log('[completion-debug] showing card for', data.sessionTitle || data.projectName);
-  showCompletionSurface(data);
-}
-
-function showCompletionSurface(data) {
-  _completionCurrent = data;
-  _completionHover = false; // reset stale hover flag from previous card
-  _lastCompletionShownAt = Date.now();
-  renderCompletionBody(data);
-  reconcileSurface();
-  startCompletionTimer();
-  // Play sound only when the card is actually displayed (not suppressed/throttled).
-  playSound('complete');
-  console.log(`[completion] show: surface=${_surface} expanded=${isExpanded} collapseTimer=${!!_collapseTimer}`);
-}
-
-function renderCompletionBody(data) {
-  const project = (data.projectName || '').trim();
-  const title = (data.sessionTitle || '').trim();
-  const tag = currentDict.completionDone || 'Completed';
-
-  const card = document.createElement('div');
-  card.className = 'completion-card';
-  const icon = document.createElement('div');
-  icon.className = 'cc-icon';
-  icon.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
-  const body = document.createElement('div');
-  body.className = 'cc-body';
-  const t = document.createElement('div'); t.className = 'cc-title';
-  const tagEl = document.createElement('span'); tagEl.className = 'cc-tag'; tagEl.textContent = '✓ ' + tag;
-  const nameEl = document.createElement('span'); nameEl.textContent = project || title || (currentDict.completionUntitled || 'Untitled');
-  t.appendChild(tagEl); t.appendChild(nameEl);
-  const s = document.createElement('div'); s.className = 'cc-sub';
-  s.textContent = title && project ? title : (data.cwd || '');
-  body.appendChild(t); body.appendChild(s);
-  card.appendChild(icon); card.appendChild(body);
-
-  card.addEventListener('click', async () => {
-    // Snapshot the current completion payload before any await — it may be cleared by the
-    // auto-dismiss timer or another state change while we're awaiting getState.
-    const snapshot = _completionCurrent;
-    // Dismiss visual state immediately so the user sees feedback.
-    if (_completionTimer) { clearTimeout(_completionTimer); _completionTimer = null; }
-    _completionCurrent = null;
-    completionBody.innerHTML = '';
-    collapse();
-
-    if (!snapshot || !snapshot.sessionId) return;
-    const targetId = snapshot.sessionId;
-    const targetCwd = snapshot.cwd || '';
-    const targetAgent = snapshot.agent || '';
-    const name = (snapshot.sessionTitle || snapshot.projectName || '').toString();
-
-    // Re-fetch latest state (currentState might be stale by the time the user clicks).
-    let sessions = currentState.sessions || [];
-    try {
-      const state = await window.codePeek.getState();
-      sessions = state.sessions || [];
-    } catch {}
-
-    const sess = sessions.find(x => x.id === targetId);
-    let pid = sess && sess.pid;
-    const cwd = (targetCwd || (sess && sess.cwd) || '').toString();
-    // Fallback priority: (1) non-stale session with matching cwd and different agent (Codex → Claude parent);
-    // (2) any non-stale session with matching cwd.
-    if (!pid && cwd) {
-      const parent = sessions.find(s =>
-        s.pid && s.isRunning !== false && s.cwd === cwd && s.agent !== targetAgent
-      ) || sessions.find(s =>
-        s.pid && s.isRunning !== false && s.cwd === cwd
-      );
-      if (parent) pid = parent.pid;
-    }
-    if (pid) {
-      window.codePeek.jumpToTerminal(pid, name, cwd);
-    } else {
-      showToast(currentDict.menuNoPid || 'No PID for this session', 'error');
-    }
-  });
-  card.addEventListener('mouseenter', () => {
-    _completionHover = true;
-    if (_completionTimer) { clearTimeout(_completionTimer); _completionTimer = null; }
-  });
-  card.addEventListener('mouseleave', () => {
-    _completionHover = false;
-    startCompletionTimer();
-  });
-
-  completionBody.innerHTML = '';
-  completionBody.appendChild(card);
-}
-
-function startCompletionTimer() {
-  if (_completionTimer) clearTimeout(_completionTimer);
-  const ms = ((currentConfig.completionDisplayTime || 5) * 1000);
-  _completionTimer = setTimeout(() => {
-    // If hovering when timer fires, wait for mouseleave instead of dismissing.
-    if (_completionHover) { _completionTimer = null; return; }
-    dismissCompletion();
-  }, ms);
-}
-
-function dismissCompletion() {
-  console.log(`[completion] dismiss: surface=${_surface} expanded=${isExpanded}`);
-  if (_completionTimer) { clearTimeout(_completionTimer); _completionTimer = null; }
-  _completionCurrent = null;
-  completionBody.innerHTML = '';
-  // If there are blocking interactions (approval/question), switch to that surface instead of collapsing.
-  if (hasBlockingInteraction()) {
-    reconcileSurface();
-  } else if (isExpanded && !manuallyPinned) {
-    collapse();
-  } else {
-    reconcileSurface();
-  }
-}
-
-function updateCompletionBadge() {
-  // Badge is rendered next to headerStats; store count on dataset so render() can pick it up.
-  if (headerStats) {
-    headerStats.dataset.completionBadge = String(_completionBadgeCount || 0);
-  }
-  render();
-}
-
-
-function applyConfigToUI() {
-  document.documentElement.style.setProperty('--font-size', currentConfig.fontSize + 'px');
-  document.documentElement.style.setProperty('--response-lines', currentConfig.responseLines || 2);
-  const peek = (typeof currentConfig.peekHeight === 'number') ? currentConfig.peekHeight : 6;
-  document.documentElement.style.setProperty('--peek-height', peek + 'px');
-  // Content scroll-area max height = panel height - header (~48) - vertical padding.
-  const ph = (typeof currentConfig.panelHeight === 'number' && currentConfig.panelHeight > 0)
-    ? currentConfig.panelHeight : 560;
-  document.documentElement.style.setProperty('--content-max-height', Math.max(120, ph - 60) + 'px');
-  if (currentConfig.mascotEnabled) mascot.classList.add('visible');
-  else mascot.classList.remove('visible');
-  const offsetX = currentConfig.panelOffsetX || 0;
-  if (offsetX && isExpanded) {
-    island.style.transform = `translateY(-2px) translateX(${offsetX}px)`;
-  }
-}
-
-function applyI18n() {
-  titleText.textContent = currentDict.appName || 'CodePeek';
-  sessionsTitle.textContent = 'Sessions';
-  permissionsTitle.textContent = currentDict.permissionRequired;
-  questionsTitle.textContent = currentDict.questions;
-  if (completionTitle) completionTitle.textContent = currentDict.completionDone || 'Completed';
-
-  // Settings modal labels
-  const mapping = {
-    settingsTitle: 'menuSettings',
-    tabGeneral: 'tabGeneral', tabBehavior: 'tabBehavior', tabAppearance: 'tabAppearance',
-    tabMascots: 'tabMascots', tabSound: 'tabSound', tabHooks: 'tabHooks', tabAbout: 'tabAbout',
-    lblLang: 'lang', lblStartOnLogin: 'startOnLogin', lblDisplay: 'display',
-    lblAutoHide: 'autoHide', lblHoverExpand: 'hoverExpand',
-    lblHoverExpandDelay: 'hoverExpandDelay', lblHoverCollapseDelay: 'hoverCollapseDelay',
-    lblCompletionTime: 'completionDisplayTime',
-    lblSuppressNotif: 'suppressNotif', lblCleanup: 'cleanupStale', lblSeconds: 'seconds',
-    lblPanelWidth: 'panelWidth', lblPanelHeight: 'panelHeight',
-    lblFontSize: 'fontSize', lblRespLines: 'responseLines', lblMascots: 'mascots',
-    lblPeekHeight: 'peekHeight',
-    lblSoundEnabled: 'soundEnabled', lblSoundPack: 'soundPack',
-    lblVolume: 'soundVolume', lblEventSounds: 'soundEvents',
-    lblSndSessionStart: 'soundSessionStart', lblSndToolUse: 'soundToolUse',
-    lblSndPermission: 'soundPermission', lblSndQuestion: 'soundQuestion', lblSndComplete: 'soundComplete',
-    lblHookStatus: 'hooksStatus', lblEnabledAgents: 'enabledAgents',
-    aboutLicense: 'aboutLicense', aboutGitHub: 'aboutGitHub'
-  };
-  for (const [id, key] of Object.entries(mapping)) {
-    const el = document.getElementById(id);
-    if (el && currentDict[key]) el.textContent = currentDict[key];
-  }
-  // Refresh hook status text if the settings panel is open.
-  if (settingsModal.style.display !== 'none') updateHookStatus();
-}
-
-// ========== Expand / collapse ==========
-
-function expand() {
-  clearTimeout(hoverCollapseTimer);
-  hoverCollapseTimer = null;
-  _startupAnimActive = false;
-  if (_collapseTimer) { clearTimeout(_collapseTimer); _collapseTimer = null; content.style.opacity = ''; content.style.pointerEvents = ''; }
-  if (isExpanded) return;
-  isExpanded = true;
-  island.classList.add('expanded-state'); // slide fully into view
-  const offsetX = currentConfig.panelOffsetX || 0;
-  if (offsetX) island.style.transform = `translateY(-2px) translateX(${offsetX}px)`;
-  content.classList.add('expanded');      // reveal content body
-  btnCollapse.style.display = 'flex';
-  window.codePeek.refreshSessions();
-  // Hover / manual expand defaults to 'list' surface, but keeps approval/question/completion if set.
-  if (_surface === 'peek') { _surface = 'list'; render(); }
-}
-
-let _collapseTimer = null;
-function collapse() {
-  clearTimeout(hoverExpandTimer);
-  clearTimeout(hoverCollapseTimer);
-  hoverExpandTimer = null;
-  hoverCollapseTimer = null;
-  // If a collapse animation is already in progress, let it finish — don't cancel the cleanup timer.
-  if (_collapseTimer) return;
-  if (!isExpanded) return;
-  isExpanded = false;
-  manuallyPinned = false;
-  _autoExpandedByEvent = false;
-
-  // Drop any event-surface inline !important styles that may have been forced earlier so the
-  // CSS rules (.content max-height:0, .island transform translateY(-100%+peek)) can take effect.
-  content.style.removeProperty('max-height');
-  content.style.removeProperty('opacity');
-  content.style.removeProperty('pointer-events');
-  content.style.removeProperty('transition');
-  island.style.removeProperty('transform');
-  island.style.removeProperty('transition');
-
-  // Phase 1: fade out content quickly while keeping height stable for the slide.
-  content.style.opacity = '0';
-  content.style.pointerEvents = 'none';
-  btnCollapse.style.display = 'none';
-
-  // Phase 2: slide the island up (height is preserved so -100% is the full distance).
-  island.classList.remove('expanded-state');
-  island.style.transform = '';
-
-  // Phase 3: after slide completes, clean up DOM state.
-  _collapseTimer = setTimeout(() => {
-    _collapseTimer = null;
-    content.classList.remove('expanded');
-    content.style.opacity = '';
-    content.style.pointerEvents = '';
-    _surface = 'peek';
-    if (_completionCurrent) {
-      if (_completionTimer) { clearTimeout(_completionTimer); _completionTimer = null; }
-      _completionCurrent = null;
-      completionBody.innerHTML = '';
-    }
-    _completionBadgeCount = 0;
-    _lastSessionStructure = '';
-    _lastSessionContent = '';
-    render();
-  }, 480);
-}
-
-function hasBlockingInteraction() {
-  return currentState.pendingPermissions.length > 0 || currentState.pendingQuestions.length > 0;
-}
-
-function isUserInputting() {
-  const a = document.activeElement;
-  return a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA' || a.tagName === 'SELECT');
-}
-
-function isModalOpen() {
-  return settingsModal.style.display !== 'none';
-}
-
-function onDragStart(e) {
-  if (!isExpanded) return;
-  if (e.target.closest('.content') || e.target.closest('.header-actions') || e.target.closest('.modal')) return;
-  _dragState = { startX: e.screenX, startOffsetX: currentConfig.panelOffsetX || 0 };
-  e.preventDefault();
-}
-
-function onDragMove(e) {
-  if (!_dragState) return;
-  const dx = e.screenX - _dragState.startX;
-  const newOffset = _dragState.startOffsetX + dx;
-  island.style.transform = `translateY(-2px) translateX(${newOffset}px)`;
-}
-
-function onDragEnd(e) {
-  if (!_dragState) return;
-  const dx = e.screenX - _dragState.startX;
-  const newOffset = _dragState.startOffsetX + dx;
-  _dragState = null;
-  window.codePeek.setConfig({ panelOffsetX: newOffset });
-}
-
-function scheduleExpand() {
-  if (!currentConfig.hoverExpand) return;
-  if (isExpanded) {
-    clearTimeout(hoverCollapseTimer);
-    hoverCollapseTimer = null;
-    return;
-  }
-  if (hoverExpandTimer) return;
-  hoverExpandTimer = setTimeout(() => {
-    hoverExpandTimer = null;
-    expand();
-  }, getHoverExpandDelay());
-}
-
-function scheduleCollapse() {
-  clearTimeout(hoverExpandTimer);
-  hoverExpandTimer = null;
-  if (!isExpanded) return;
-  // Don't auto-collapse while a completion card is displayed — let its own timer handle dismissal.
-  if (_completionCurrent) return;
-  // Intentionally no isUserInputting guard: a stuck focused input after closing Settings would block collapse forever.
-  if (manuallyPinned || hasBlockingInteraction() || isModalOpen()) return;
-  if (!currentConfig.autoHidePanel) return;
-  clearTimeout(hoverCollapseTimer);
-  hoverCollapseTimer = setTimeout(() => {
-    hoverCollapseTimer = null;
-    if (!manuallyPinned && !hasBlockingInteraction() && !isModalOpen()) {
-      collapse();
-    }
-  }, getHoverCollapseDelay());
-}
-
-// ========== Render (rAF-batched to avoid flicker from frequent scanner ticks) ==========
-
-let _renderScheduled = false;
+// ========== Render ==========
+let renderScheduled = false;
 function render() {
-  if (_renderScheduled) return;
-  _renderScheduled = true;
+  if (ui.animating) { ui.renderQueued = true; return; }
+  if (renderScheduled) return;
+  renderScheduled = true;
   requestAnimationFrame(() => {
-    _renderScheduled = false;
-    _doRender();
+    renderScheduled = false;
+    renderNow();
   });
 }
 
-// Event surfaces (approval/question/completion) must render synchronously — the window can be
-// peek-small and transparent, where rAF gets throttled by the compositor and the user ends up
-// staring at an empty shell while the card silently failed to paint.
+// Event surfaces paint synchronously: rAF is throttled while the transparent window is idle.
 function renderNow() {
-  _renderScheduled = false;
-  _doRender();
+  ui.renderQueued = false;
+  renderHeader();
+  renderIndicator();
+  renderBanner();
+  renderSurface(ui.surface);
 }
 
-function _doRender() {
-  const { sessions, pendingPermissions, pendingQuestions } = currentState;
-  const activeSessions = sessions.filter(s => s.isRunning !== false);
-  const totalCount = sessions.length;
-  const activeCount = activeSessions.length;
-  const hasPending = pendingPermissions.length > 0 || pendingQuestions.length > 0;
+function renderSurface(name) {
+  if (name === 'list') renderSessions();
+  else if (name === 'approval') renderApproval();
+  else if (name === 'question') renderQuestionSurface();
+  else if (name === 'completion') renderCompletion();
+}
 
-  statusDot.className = 'status-dot';
-  if (hasPending) statusDot.classList.add('warning');
-  else if (activeCount > 0) statusDot.classList.add('active');
+function sessionCounts() {
+  const sessions = currentState.sessions;
+  const running = sessions.filter(s => s.isRunning !== false && ['thinking', 'tool_use', 'subagent', 'compacting'].includes(s.status)).length;
+  return { total: sessions.length, running, pending: liveRequests().length };
+}
 
-  // Peek bar color (static; only the color itself switches)
-  const islandBody = document.getElementById('islandBody');
-  if (islandBody) {
-    islandBody.classList.remove('peek-idle', 'peek-active', 'peek-pending');
-    if (hasPending) islandBody.classList.add('peek-pending');
-    else if (activeCount > 0) islandBody.classList.add('peek-active');
-    else islandBody.classList.add('peek-idle');
+function renderHeader() {
+  const { total, running, pending } = sessionCounts();
+  statusDot.className = 'dot' + (pending ? ' a' : running ? ' g' : '');
+  headerStats.textContent = pending
+    ? `${running} ${t('statsRunning')} · ${pending} ${t('statsPending')}`
+    : total ? `${running} ${t('statsRunning')} · ${total} ${t('statsSessions')}` : '';
+  if (completionBadge > 0) {
+    const b = el('span', 'badge', completionBadge);
+    headerStats.appendChild(b);
   }
+  const group = currentConfig.sessionGrouping || 'status';
+  groupTabs.querySelectorAll('.tab').forEach(b => b.classList.toggle('on', b.dataset.group === group));
+  const muted = !currentConfig.soundEnabled;
+  $('icoMute').textContent = String.fromCharCode(muted ? 0xE74F : 0xE767);
+  btnMute.title = muted ? t('tipUnmute') : t('tipMute');
+  btnPin.classList.toggle('on', ui.pinned);
+  btnPin.title = ui.pinned ? t('tipUnpin') : t('tipPin');
+  btnSettings.title = t('tipSettings');
+  btnCollapse.title = t('tipCollapse');
+}
 
-  // Header stats + completion badge
-  if (totalCount > 0) {
-    headerStats.innerHTML = `<span class="active-count">${activeCount} ${currentDict.sessionsActive}</span> <span class="total-count">&middot; ${totalCount} ${currentDict.sessionsTotal}</span>`;
+function renderBanner() {
+  const n = liveRequests().length;
+  const on = ui.settingsOpen && n > 0;
+  pendingBanner.classList.toggle('on', on);
+  if (on) {
+    pendingBanner.textContent = '';
+    pendingBanner.appendChild(icon('E7BA'));
+    pendingBanner.appendChild(document.createTextNode(fmt('pendingBanner', { n }) + ' ›'));
+  }
+}
+
+// ---------- Collapsed indicator ----------
+let pillKey = '';
+function renderIndicator() {
+  const reqs = liveRequests();
+  const mode = currentConfig.collapsedMode || 'smart';
+  const showPill = mode === 'pill' || (mode === 'smart' && reqs.length > 0);
+  indicator.classList.toggle('mode-pill', showPill);
+  indicator.classList.toggle('mode-strip', !showPill);
+  const { running } = sessionCounts();
+  strip.classList.toggle('pending', reqs.length > 0);
+  strip.classList.toggle('running', reqs.length === 0 && running > 0);
+  if (!showPill) return;
+
+  const sessions = currentState.sessions;
+  let agent = 'claude', status = 'idle', key, build;
+  if (reqs.length) {
+    const oldest = reqs.slice().sort((a, b) => a.timestamp - b.timestamp)[0];
+    const s = sessions.find(x => x.id === oldest.sessionId) || {};
+    agent = s.agent || 'claude';
+    status = 'waiting_permission';
+    const tool = oldest.toolName || '';
+    const label = oldest.id.startsWith('q_') || tool === 'AskUserQuestion' ? t('chipQuestion') : t('chipWaiting');
+    key = `req:${oldest.id}:${reqs.length}:${agent}`;
+    build = () => {
+      pillText.textContent = '';
+      pillText.appendChild(el('b', '', sessionName(s, oldest.sessionId)));
+      pillText.appendChild(document.createTextNode(` › ${label}${tool && tool !== 'AskUserQuestion' ? ' · ' + tool : ''}`));
+      pillBadge.textContent = `${reqs.length} ${t('statsPending')}`;
+      pillTime.dataset.since = String(oldest.timestamp || Date.now());
+    };
   } else {
-    headerStats.textContent = '';
+    const runningSessions = sessions.filter(s => s.isRunning !== false && ['thinking', 'tool_use', 'subagent', 'compacting'].includes(s.status));
+    if (runningSessions.length) {
+      const s = runningSessions[0];
+      agent = s.agent || 'claude';
+      status = 'tool_use';
+      key = `run:${runningSessions.length}:${s.id}:${s.currentTool || ''}:${agent}`;
+      build = () => {
+        pillText.textContent = '';
+        if (runningSessions.length === 1) {
+          pillText.appendChild(el('b', '', sessionName(s)));
+          pillText.appendChild(document.createTextNode(' › '));
+          pillText.appendChild(el('span', 'shimmer', t('chipRunning')));
+          if (s.currentTool) pillText.appendChild(document.createTextNode(` · ${s.currentTool}`));
+        } else {
+          pillText.appendChild(el('span', 'shimmer', fmt('pillRunning', { n: runningSessions.length })));
+        }
+        pillBadge.textContent = '';
+        delete pillTime.dataset.since;
+        pillTime.textContent = '';
+      };
+    } else {
+      key = 'idle';
+      build = () => {
+        pillText.textContent = t('pillIdle');
+        pillBadge.textContent = '';
+        delete pillTime.dataset.since;
+        pillTime.textContent = '';
+      };
+    }
   }
-  if (_completionBadgeCount > 0) {
-    const badge = document.createElement('span');
-    badge.className = 'completion-badge';
-    badge.textContent = String(_completionBadgeCount);
-    headerStats.appendChild(badge);
-  }
-
-  // Surface dispatch: the island renders exactly one surface at a time.
-  const showList      = _surface === 'list';
-  const showApproval  = _surface === 'approval';
-  const showQuestion  = _surface === 'question';
-  const showCompletion = _surface === 'completion';
-  // Keep event surfaces forcibly visible every render — something (possibly a collapse animation
-  // phase or residual inline style from a race) has been clobbering opacity to 0. Hard-set on
-  // every render so the card is never invisible while active.
-  if (showApproval || showQuestion || showCompletion) {
-    content.style.setProperty('opacity', '1', 'important');
-    content.style.setProperty('max-height', '540px', 'important');
-    content.style.setProperty('pointer-events', 'auto', 'important');
-  }
-  sessionsSection.style.display    = showList ? 'block' : 'none';
-  permissionsSection.style.display = showApproval ? 'block' : 'none';
-  questionsSection.style.display   = showQuestion ? 'block' : 'none';
-  completionSection.style.display  = showCompletion ? 'block' : 'none';
-
-  if (showList) renderSessions(sessions);
-  if (showApproval) renderPermissions(pendingPermissions.slice(0, 1)); // show only the head of the queue
-  if (showQuestion) renderQuestions(pendingQuestions.slice(0, 1));
+  if (key === pillKey) return;
+  pillKey = key;
+  build();
+  setMascot(pillMascot, agent, status, 20);
+  tickClocks();
 }
 
-let _lastSessionStructure = ''; // triggers full rebuild (IDs + agents)
-let _lastSessionContent = '';   // triggers in-place update only
-function renderSessions(sessions) {
-  // Structure fingerprint: session IDs and agent types (adding/removing cards)
-  const groupMode = currentConfig.sessionGrouping || 'all';
-  const structFp = groupMode + ':' + sessions.map(s => `${s.id}:${s.agent || ''}:${s.isRunning}:${agentStatusToMascotState(s.status || 'idle')}`).join('|');
-  // Content fingerprint: status, tool, error, prompt, response
-  const contentFp = sessions.map(s => `${s.status}:${s.currentTool || ''}:${s.lastError || ''}:${s.lastPrompt || ''}:${s.lastResponse || ''}`).join('|');
-
-  // If only content changed (not structure), patch existing cards in place.
-  if (structFp === _lastSessionStructure && contentFp !== _lastSessionContent) {
-    _lastSessionContent = contentFp;
-    _patchSessionCards(sessions);
+function setMascot(host, agent, status, size) {
+  const state = (typeof agentStatusToMascotState === 'function') ? agentStatusToMascotState(status) : status;
+  const sig = `${agent}:${state}:${size}:${currentConfig.mascotEnabled !== false}`;
+  if (host.dataset.sig === sig) return;
+  host.dataset.sig = sig;
+  const old = host.querySelector('canvas');
+  if (old) destroyMascotCanvas(old);
+  host.textContent = '';
+  if (currentConfig.mascotEnabled === false) {
+    const a = currentAgents.find(x => x.id === agent) || {};
+    const b = el('span', 'agent-badge', (a.icon || agent[0] || '?').toString().toUpperCase());
+    b.style.background = sanitizeColor(a.color);
+    b.style.width = b.style.height = Math.round(size * 0.75) + 'px';
+    host.appendChild(b);
     return;
   }
-  if (structFp === _lastSessionStructure && contentFp === _lastSessionContent) return;
+  host.appendChild(createMascotCanvas(agent, status, size));
+}
 
-  _lastSessionStructure = structFp;
-  _lastSessionContent = contentFp;
+// ---------- Session list ----------
+function sessionName(s, fallbackId) {
+  return (s && (s.name || s.projectName)) || shortId((s && s.id) || fallbackId || '');
+}
 
-  // Full rebuild: destroy old canvases
-  sessionsList.querySelectorAll('.session-agent-badge').forEach(b => {
-    if (b._mascotCanvas) destroyMascotCanvas(b._mascotCanvas);
-  });
-  sessionsList.innerHTML = '';
+function statusView(s) {
+  if (s.isRunning === false) return { key: 'ended', chip: 'gray', label: t('chipEnded'), cls: 's-ended', mascot: 'idle' };
+  const hasPerm = livePerms().some(p => p.sessionId === s.id);
+  const hasQ = liveQuestions().some(q => q.sessionId === s.id);
+  if (hasPerm || s.status === 'waiting_permission') return { key: 'needs', chip: 'amber', label: t('chipWaiting'), cls: 's-wait', mascot: 'waiting_permission' };
+  if (hasQ || s.status === 'waiting_answer') return { key: 'needs', chip: 'blue', label: t('chipQuestion'), cls: 's-ask', mascot: 'waiting_answer' };
+  switch (s.status) {
+    case 'thinking':
+    case 'tool_use': return { key: 'running', chip: 'green', label: t('chipRunning'), cls: 's-run', mascot: s.status };
+    case 'subagent': return { key: 'running', chip: 'violet', label: t('chipSubagent'), cls: 's-run', mascot: 'subagent' };
+    case 'compacting': return { key: 'running', chip: 'cyan', label: t('chipCompacting'), cls: 's-run', mascot: 'compacting' };
+    case 'idle': return { key: 'idle', chip: 'gray', label: t('chipIdle'), cls: 's-idle', mascot: 'idle' };
+    default: return { key: 'idle', chip: 'gray', label: t('chipOnline'), cls: 's-idle', mascot: 'idle' };
+  }
+}
 
-  const mode = currentConfig.sessionGrouping || 'all';
-  // Update active button (always, even when the list is empty).
-  document.querySelectorAll('.group-btn').forEach(b => {
-    b.classList.toggle('active', b.dataset.group === mode);
-  });
+const GROUP_ORDER = ['needs', 'running', 'idle', 'ended'];
+const GROUP_LABEL = { needs: 'grpNeedsAction', running: 'grpRunning', idle: 'grpIdle', ended: 'grpEnded' };
+const GROUP_DOT = { needs: 'a', running: 'g', idle: '', ended: '' };
 
+function renderSessions() {
+  const sessions = currentState.sessions;
   if (sessions.length === 0) {
-    const empty = document.createElement('div');
-    empty.className = 'empty-state';
-    empty.textContent = currentDict.noSessions;
-    sessionsList.appendChild(empty);
+    clearSessionCards();
+    if (!emptyNode || emptyNode._hooks !== hooksInstalled) {
+      if (emptyNode) emptyNode.querySelectorAll('canvas').forEach(c => destroyMascotCanvas(c));
+      emptyNode = buildEmptyState();
+      emptyNode._hooks = hooksInstalled;
+    }
+    syncChildren(sessionsList, [emptyNode]);
+    lastLayout = null;
     return;
   }
+  if (emptyNode && emptyNode.isConnected) emptyNode.remove();
 
-  if (mode === 'all') {
-    for (const s of sessions) sessionsList.appendChild(buildSessionCard(s));
-    return;
+  const mode = currentConfig.sessionGrouping || 'status';
+  const views = new Map(sessions.map(s => [s.id, statusView(s)]));
+  const keyOf = (s) => (mode === 'status' ? views.get(s.id).key : mode === 'cli' ? 'cli:' + (s.agent || 'claude') : 'all');
+  // While the cursor is over the list, order and group membership are frozen so click targets never move.
+  const frozen = !!(mouseInIsland && ui.expanded && lastLayout && lastLayout.mode === mode);
+  let ordered = sessions.slice();
+  if (frozen) {
+    const idx = new Map(lastLayout.order.map((id, i) => [id, i]));
+    ordered.sort((a, b) => (idx.has(a.id) ? idx.get(a.id) : 1e9) - (idx.has(b.id) ? idx.get(b.id) : 1e9));
   }
 
   const groups = new Map();
-  for (const s of sessions) {
-    let key;
-    if (mode === 'status') {
-      if (s.isRunning === false) key = 'Stale';
-      else if (s.status === 'waiting_permission' || s.status === 'waiting_answer') key = 'Waiting';
-      else if (s.status === 'tool_use' || s.status === 'thinking' || s.status === 'active') key = 'Running';
-      else key = 'Idle';
-    } else {
-      key = (s.agent || 'claude').charAt(0).toUpperCase() + (s.agent || 'claude').slice(1);
-    }
+  const groupOf = new Map();
+  for (const s of ordered) {
+    const key = frozen && lastLayout.group.has(s.id) ? lastLayout.group.get(s.id) : keyOf(s);
+    groupOf.set(s.id, key);
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(s);
   }
-
-  for (const [label, items] of groups) {
-    const hdr = document.createElement('div');
-    hdr.className = 'group-header';
-    hdr.textContent = `${label} (${items.length})`;
-    sessionsList.appendChild(hdr);
-    for (const s of items) sessionsList.appendChild(buildSessionCard(s));
+  let groupKeys = Array.from(groups.keys());
+  if (frozen) {
+    const gi = new Map(lastLayout.groups.map((k, i) => [k, i]));
+    groupKeys.sort((a, b) => (gi.has(a) ? gi.get(a) : 1e9) - (gi.has(b) ? gi.get(b) : 1e9));
+  } else if (mode === 'status') {
+    groupKeys.sort((a, b) => GROUP_ORDER.indexOf(a) - GROUP_ORDER.indexOf(b));
   }
+
+  const nodes = [];
+  const seen = new Set();
+  for (const key of groupKeys) {
+    const items = groups.get(key);
+    if (mode !== 'all') nodes.push(groupHeader(key, items.length, mode));
+    const folded = mode === 'status' && foldedGroups.has(key);
+    if (folded) continue;
+    for (const s of items) {
+      nodes.push(sessionCard(s, views.get(s.id)));
+      seen.add(s.id);
+    }
+  }
+  for (const [id, c] of sessionCards) {
+    if (!seen.has(id)) {
+      const canvas = c.el.querySelector('canvas');
+      if (canvas) destroyMascotCanvas(canvas);
+      c.el.remove();
+      sessionCards.delete(id);
+    }
+  }
+  syncChildren(sessionsList, nodes);
+  if (!frozen) lastLayout = { mode, order: ordered.map(s => s.id), group: groupOf, groups: groupKeys };
 }
 
-function _patchSessionCards(sessions) {
-  const cards = sessionsList.querySelectorAll('.session-card');
-  const sessionMap = new Map(sessions.map(s => [s.id, s]));
-  cards.forEach(card => {
-    const sid = card.dataset.sessionId;
-    const s = sessionMap.get(sid);
-    if (!s) return;
-    // Patch status dot + label
-    const dot = card.querySelector('.session-status-dot');
-    const lbl = card.querySelector('.session-status-label');
-    const statusClass = s.isRunning === false ? 'stale' : (s.status || 'active');
-    if (dot) { dot.className = 'session-status-dot ' + statusClass; }
-    if (lbl) { lbl.className = 'session-status-label ' + statusClass; lbl.textContent = s.isRunning === false ? currentDict.statusStale : getStatusLabel(s.status || 'active'); }
-    // Patch tool bar
-    let toolBar = card.querySelector('.session-tool-bar');
-    const toolInfo = getLingeringTool(s);
-    if (toolInfo) {
-      if (!toolBar) { toolBar = document.createElement('div'); const meta = card.querySelector('.session-meta'); if (meta) meta.after(toolBar); else card.appendChild(toolBar); }
-      toolBar.className = 'session-tool-bar tool-color-' + getToolColorClass(toolInfo.tool);
-      if (toolInfo.lingering) toolBar.classList.add('tool-lingering');
-      toolBar.textContent = toolInfo.input ? `${toolInfo.tool}: ${String(toolInfo.input).substring(0, 80)}` : String(toolInfo.tool);
-    } else if (toolBar) {
-      toolBar.remove();
-    }
-    // Patch time
-    const timeEl = card.querySelector('.session-time');
-    if (timeEl) timeEl.textContent = formatTimeAgo(s.lastActivity || s.lastActivityAt || s.startedAt);
-    // Patch error
-    let errEl = card.querySelector('.session-error');
-    if (s.lastError) {
-      if (!errEl) { errEl = document.createElement('div'); errEl.className = 'session-error'; card.appendChild(errEl); }
-      errEl.textContent = '⚠ ' + String(s.lastError).substring(0, 100);
-    } else if (errEl) { errEl.remove(); }
-  });
+function syncChildren(parent, nodes) {
+  for (let i = 0; i < nodes.length; i++) {
+    if (parent.children[i] !== nodes[i]) parent.insertBefore(nodes[i], parent.children[i] || null);
+  }
+  while (parent.children.length > nodes.length) parent.lastElementChild.remove();
 }
 
-function buildSessionCard(s) {
-  const name = s.name || s.projectName || shortId(s.id);
-  const statusClass = s.isRunning === false ? 'stale' : (s.status || 'active');
-  const statusLabel = s.isRunning === false ? currentDict.statusStale : getStatusLabel(s.status || 'active');
-  const timeAgo = formatTimeAgo(s.lastActivity || s.lastActivityAt || s.startedAt);
-  const model = formatModel(s.model);
-  const agentId = s.agent || 'claude';
-  const agent = currentAgents.find(a => a.id === agentId) || { color: '#D97757', icon: 'C' };
-
-  const card = document.createElement('div');
-  card.className = 'session-card';
-  if (s.isRunning === false) card.classList.add('stale');
-  else if (s.status) card.classList.add(s.status); // active / thinking / tool_use / ...
-  if (s.id === selectedSessionId) card.classList.add('selected');
-  // Using dataset means values are auto-escaped and cannot be interpreted as attribute injection.
-  if (s.pid) card.dataset.pid = String(parseInt(s.pid) || '');
-  card.dataset.sessionId = String(s.id || '');
-  card.dataset.sessionName = String(name || '');
-  card.dataset.cwd = String(s.cwd || '');
-  card.dataset.isRunning = (s.isRunning === false) ? 'false' : 'true';
-  card.dataset.agent = String(agentId);
-  card.addEventListener('click', (e) => handleSessionClick(card, e));
-
-  // Top row
-  const top = document.createElement('div');
-  top.className = 'session-top';
-
-  const badge = document.createElement('span');
-  badge.className = 'session-agent-badge';
-  badge.style.background = 'transparent';
-  const mascotCanvas = createMascotCanvas(agentId, s.status || 'idle', 32);
-  badge.appendChild(mascotCanvas);
-  badge._mascotCanvas = mascotCanvas;
-
-  const nameEl = document.createElement('span');
-  nameEl.className = 'session-name';
-  nameEl.textContent = name;
-
-  const timeEl = document.createElement('span');
-  timeEl.className = 'session-time';
-  timeEl.textContent = timeAgo;
-
-  top.appendChild(badge);
-  top.appendChild(nameEl);
-  top.appendChild(timeEl);
-  card.appendChild(top);
-
-  // meta
-  const meta = document.createElement('div');
-  meta.className = 'session-meta';
-  const dot = document.createElement('span');
-  dot.className = 'session-status-dot ' + statusClass;
-  const lbl = document.createElement('span');
-  lbl.className = 'session-status-label ' + statusClass;
-  lbl.textContent = statusLabel;
-  meta.appendChild(dot);
-  meta.appendChild(lbl);
-  if (model) {
-    const sep = document.createElement('span');
-    sep.className = 'session-separator';
-    meta.appendChild(sep);
-    const modelEl = document.createElement('span');
-    modelEl.className = 'session-model';
-    modelEl.textContent = model;
-    meta.appendChild(modelEl);
+function clearSessionCards() {
+  for (const [, c] of sessionCards) {
+    const canvas = c.el.querySelector('canvas');
+    if (canvas) destroyMascotCanvas(canvas);
   }
-  card.appendChild(meta);
+  sessionCards.clear();
+}
 
-  // Current tool (with linger effect)
-  {
-    const toolInfo = getLingeringTool(s);
-    if (toolInfo) {
-      const tool = document.createElement('div');
-      tool.className = 'session-tool-bar tool-color-' + getToolColorClass(toolInfo.tool);
-      if (toolInfo.lingering) tool.classList.add('tool-lingering');
-      tool.textContent = (toolInfo.input
-        ? `${toolInfo.tool}: ${String(toolInfo.input).substring(0, 80)}`
-        : String(toolInfo.tool));
-      card.appendChild(tool);
-    }
+function groupHeader(key, count, mode) {
+  let h = groupHeaders.get(key);
+  if (!h) {
+    h = el('div', 'grp');
+    h.dataset.key = key;
+    h.addEventListener('click', () => {
+      if (!h.classList.contains('fold')) return;
+      if (foldedGroups.has(key)) foldedGroups.delete(key); else foldedGroups.add(key);
+      renderSessions();
+    });
+    groupHeaders.set(key, h);
   }
-
-  // Error
-  if (s.lastError) {
-    const err = document.createElement('div');
-    err.className = 'session-error';
-    err.textContent = '⚠ ' + String(s.lastError).substring(0, 100);
-    card.appendChild(err);
+  h.textContent = '';
+  const foldable = mode === 'status' && key === 'ended';
+  h.classList.toggle('fold', foldable);
+  h.classList.toggle('open', foldable && !foldedGroups.has(key));
+  if (foldable) h.appendChild(icon('E70D', 'chev'));
+  else if (mode === 'status') h.appendChild(el('span', 'dot ' + (GROUP_DOT[key] || '')));
+  let label;
+  if (mode === 'status') label = t(GROUP_LABEL[key]);
+  else {
+    const agentId = key.slice(4);
+    const a = currentAgents.find(x => x.id === agentId);
+    label = (a && a.name) || agentId;
   }
+  h.appendChild(el('b', '', label));
+  h.appendChild(el('span', 'n', count));
+  return h;
+}
 
-  // Conversation preview
-  if (s.lastPrompt || s.lastResponse) {
-    const convo = document.createElement('div');
-    convo.className = 'session-conversation';
-    if (s.lastPrompt) {
-      const lbl1 = document.createElement('div');
-      lbl1.className = 'convo-label';
-      lbl1.textContent = currentDict.lastPrompt;
-      convo.appendChild(lbl1);
-      const txt1 = document.createElement('div');
-      txt1.className = 'convo-text';
-      txt1.textContent = String(s.lastPrompt);
-      convo.appendChild(txt1);
-    }
-    if (s.lastResponse) {
-      const lbl2 = document.createElement('div');
-      lbl2.className = 'convo-label response';
-      lbl2.textContent = currentDict.lastResponse;
-      convo.appendChild(lbl2);
-      const txt2 = document.createElement('div');
-      txt2.className = 'convo-text';
-      txt2.textContent = String(s.lastResponse);
-      convo.appendChild(txt2);
-    }
-    card.appendChild(convo);
+function sessionCard(s, view) {
+  let c = sessionCards.get(s.id);
+  if (!c) {
+    const root = el('div', 'card');
+    root.dataset.sessionId = s.id;
+    const av = el('div', 'av');
+    const main = el('div', 'cmain');
+    const row1 = el('div', 'row1');
+    const chip = el('span', 'chip');
+    const name = el('span', 'name');
+    const branch = el('span', 'branch');
+    const meta = el('span', 'meta');
+    const time = el('span', 'tchip');
+    const term = el('span', 'term');
+    meta.append(time, term);
+    row1.append(chip, name, branch, meta);
+    const prompt = el('div', 'line prompt');
+    const reply = el('div', 'line reply');
+    const tool = el('div', 'tool');
+    const err = el('div', 'line err');
+    main.append(row1, prompt, reply, tool, err);
+    root.append(av, main);
+    root.addEventListener('click', (e) => handleSessionClick(s.id, e));
+    c = { el: root, refs: { av, chip, name, branch, time, term, prompt, reply, tool, err }, fp: '' };
+    sessionCards.set(s.id, c);
   }
+  const toolInfo = toolLineFor(s, view);
+  const fp = [view.cls, view.label, sessionName(s), s.gitBranch, s.lastPrompt, s.lastResponse, s.lastError, s.pid,
+    toolInfo ? `${toolInfo.cls}|${toolInfo.name}|${toolInfo.arg}|${toolInfo.linger}` : '', s.id === selectedSessionId,
+    currentConfig.mascotEnabled].join('\u0001');
+  const r = c.refs;
+  r.time.textContent = formatTimeAgo(s.lastActivity || s.lastActivityAt || s.startedAt);
+  setMascot(r.av, s.agent || 'claude', view.mascot, 36);
+  if (fp === c.fp) return c.el;
+  c.fp = fp;
 
-  // Jump / Reopen hint
-  const hint = document.createElement('span');
-  hint.className = 'jump-hint';
+  c.el.className = 'card ' + view.cls + (s.id === selectedSessionId ? ' selected' : '');
+  c.el.title = [s.model ? formatModel(s.model) : '', s.cwd || ''].filter(Boolean).join(' · ');
+  r.chip.className = 'chip ' + view.chip;
+  r.chip.textContent = view.label;
+  r.name.textContent = sessionName(s);
+  r.branch.textContent = s.gitBranch ? `⑂ ${s.gitBranch}` : '';
+  r.branch.style.display = s.gitBranch ? '' : 'none';
+  r.term.textContent = '';
   if (s.isRunning === false) {
-    hint.textContent = `${currentDict.reopen || 'Reopen'} →`;
-    hint.classList.add('reopen');
-  } else if (s.pid) {
-    hint.textContent = `${currentDict.jump} →`;
+    r.term.appendChild(icon('E72C'));
+    r.term.appendChild(document.createTextNode(t('reopen')));
   } else {
-    // Active session without a PID (should not normally happen)
-    hint.style.display = 'none';
+    const a = currentAgents.find(x => x.id === (s.agent || 'claude'));
+    r.term.appendChild(icon('E756'));
+    r.term.appendChild(document.createTextNode((a && a.name) || (s.agent || 'claude')));
   }
-  card.appendChild(hint);
-
-  return card;
+  setText(r.prompt, s.lastPrompt);
+  setText(r.reply, s.lastResponse);
+  setText(r.err, s.lastError ? '⚠ ' + String(s.lastError).substring(0, 160) : '');
+  r.tool.textContent = '';
+  r.tool.style.display = toolInfo ? '' : 'none';
+  r.tool.classList.toggle('linger', !!(toolInfo && toolInfo.linger));
+  if (toolInfo) {
+    r.tool.appendChild(el('span', 'tn ' + toolInfo.cls, toolInfo.name));
+    if (toolInfo.arg) r.tool.appendChild(el('span', 'arg', toolInfo.arg));
+  }
+  return c.el;
 }
 
-// Allow only #RRGGBB / #RRGGBBAA / rgb() / rgba() forms to prevent CSS injection.
-function sanitizeColor(color) {
-  if (!color || typeof color !== 'string') return '#8E8E93';
-  if (/^#[0-9a-fA-F]{3,8}$/.test(color)) return color;
-  if (/^rgba?\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*(,\s*[\d.]+\s*)?\)$/.test(color)) return color;
-  return '#8E8E93';
+function setText(node, text) {
+  const v = text ? String(text) : '';
+  node.textContent = v;
+  node.style.display = v ? '' : 'none';
 }
 
-let _lastRenderedPermissionId = null;
-// Sticky card state. Permission/question cards stay visible after bridge closes (which happens
-// within ms when Claude self-answers via its TUI) until the user explicitly dismisses by clicking
-// any button on the card, or until a newer event replaces it. No automatic expiry — the user
-// asked for permanent visibility since Claude often answers faster than they can react.
-let _permStickyCard = null;
-let _questionStickyCard = null;
-function dismissStickyPermission() {
-  if (_permStickyCard) { _permStickyCard = null; reconcileSurface(); render(); }
+function toolLineFor(s, view) {
+  if (view.key === 'needs') {
+    const p = livePerms().find(x => x.sessionId === s.id);
+    if (p) {
+      const d = p.display || {};
+      return { cls: 't-wait', name: '⏸ ' + (p.toolName === 'AskUserQuestion' ? t('chipQuestion') : p.toolName), arg: d.command || d.path || p.toolInput || '', linger: false };
+    }
+  }
+  const now = Date.now();
+  if (s.currentTool) {
+    lastToolBySession.set(s.id, { tool: s.currentTool, input: s.toolInput, endedAt: 0 });
+    return { cls: toolClass(s.currentTool), name: '▶ ' + s.currentTool, arg: s.toolInput || '', linger: false };
+  }
+  const last = lastToolBySession.get(s.id);
+  if (!last) return null;
+  if (!last.endedAt) {
+    last.endedAt = now;
+    setTimeout(() => { if (sessionCards.has(s.id)) { sessionCards.get(s.id).fp = ''; render(); } }, TOOL_LINGER_MS + 50);
+  }
+  if (now - last.endedAt > TOOL_LINGER_MS) { lastToolBySession.delete(s.id); return null; }
+  return { cls: toolClass(last.tool), name: '▶ ' + last.tool, arg: last.input || '', linger: true };
 }
-function dismissStickyQuestion() {
-  if (_questionStickyCard) { _questionStickyCard = null; reconcileSurface(); render(); }
+
+function toolClass(name) {
+  switch (name) {
+    case 'Bash': case 'PowerShell': return 't-bash';
+    case 'Edit': case 'Write': case 'MultiEdit': case 'NotebookEdit': return 't-edit';
+    case 'Read': return 't-read';
+    case 'Grep': case 'Glob': case 'WebSearch': case 'WebFetch': return 't-grep';
+    case 'Agent': case 'Task': return 't-agent';
+    default: return '';
+  }
 }
-function renderPermissions(permissions) {
-  // If live pending has drained but we have a sticky card, keep showing it indefinitely.
-  // User must click Allow/Deny/Always (or a new event arrives) to dismiss. Buttons will still
-  // fire the IPC even if the bridge closed — main-side approvePermission is a no-op when the
-  // pending id is unknown, so this is safe.
-  if (permissions.length === 0 && _permStickyCard) {
-    permissionsSection.style.display = 'block';
-    return;
+
+function buildEmptyState() {
+  const box = el('div', 'empty');
+  const av = el('div', 'av');
+  setMascot(av, 'claude', 'idle', 40);
+  box.appendChild(av);
+  if (!hooksInstalled) {
+    box.appendChild(el('div', 'em-title', t('setupTitle')));
+    box.appendChild(el('div', 'em-hint', t('setupHint')));
+    const b = el('button', 'btn allow', t('setupBtn'));
+    b.addEventListener('click', async () => {
+      const results = await window.codePeek.installAllHooks();
+      hooksInstalled = !!(results && results.claude && results.claude.success);
+      showToast(hooksInstalled ? t('hooksInstalled') : t('operationFailed'), hooksInstalled ? 'success' : 'error');
+      render();
+    });
+    box.appendChild(b);
+  } else {
+    box.appendChild(el('div', 'em-title', t('emptyTitle')));
+    box.appendChild(el('div', 'em-hint', t('emptyHint')));
   }
-  if (permissions.length === 0) {
-    permissionsSection.style.display = 'none';
-    permissionsList.innerHTML = '';
-    _lastRenderedPermissionId = null;
-    return;
+  return box;
+}
+
+// ---------- Approval surface ----------
+function renderApproval() {
+  const perms = livePerms();
+  let focus = null;
+  for (const [id, x] of exiting) if (x.surface === 'approval') { focus = x.el; break; }
+  if (!focus) {
+    const p = perms.find(x => !snoozed.has(x.id)) || perms[0];
+    if (!p) { permissionsList.textContent = ''; return; }
+    focus = requestCards.get(p.id) || buildRequestCard(p);
+    requestCards.set(p.id, focus);
+    // AskUserQuestion cards use the same slot for their own "question n / N" step indicator.
+    const q = focus.querySelector('.queue');
+    if (q && !focus._isAsk) q.textContent = perms.length > 1 ? `${perms.indexOf(p) + 1} / ${perms.length}` : '';
   }
-  // CRITICAL: do not rebuild DOM if the head permission id hasn't changed. Otherwise every
-  // scanner state-changed tick wipes the user's selected-option state on an AskUserQuestion card.
-  const headId = permissions[0].id;
-  if (headId === _lastRenderedPermissionId && permissionsList.children.length > 0) {
-    permissionsSection.style.display = 'block';
-    _permStickyCard = permissions[0];
-    return;
+  if (permissionsList.firstElementChild !== focus || permissionsList.children.length !== 1) {
+    permissionsList.textContent = '';
+    permissionsList.appendChild(focus);
   }
-  permissionsList.innerHTML = '';
-  permissionsSection.style.display = 'block';
-  for (const p of permissions) {
-    permissionsList.appendChild(buildPermissionCard(p));
+}
+
+function buildRequestCard(p) {
+  if (p.toolName === 'AskUserQuestion' && Array.isArray(p.questions) && p.questions.length > 0) return buildAskCard(p);
+  return buildPermissionCard(p);
+}
+
+function sourceRow(p, chipDot) {
+  const s = currentState.sessions.find(x => x.id === p.sessionId) || {};
+  const row = el('div', 'src');
+  row.appendChild(el('span', 'dot ' + chipDot));
+  row.appendChild(el('span', 'name', sessionName(s, p.sessionId)));
+  if (s.gitBranch) row.appendChild(el('span', 'branch', `⑂ ${s.gitBranch}`));
+  const a = currentAgents.find(x => x.id === (s.agent || 'claude'));
+  const when = el('span', 'when');
+  when.appendChild(document.createTextNode(`· ${(a && a.name) || 'Claude'}${p.isSubagent ? ' · ' + t('subagentTag') : ''} · ${t('waitingFor')} `));
+  const since = el('b');
+  since.dataset.since = String(p.timestamp || Date.now());
+  when.appendChild(since);
+  row.appendChild(when);
+  row.appendChild(el('span', 'queue'));
+  if (s.pid || s.cwd) {
+    const jump = el('button', 'ibtn');
+    jump.title = t('tipJump');
+    jump.appendChild(icon('E8A7'));
+    jump.addEventListener('click', (e) => { e.stopPropagation(); jumpToSession(s.id || p.sessionId); });
+    row.appendChild(jump);
   }
-  _permStickyCard = permissions[0];
-  // Play sound only when a new permission card appears (not on every re-render).
-  if (headId && headId !== _lastRenderedPermissionId) {
-    _lastRenderedPermissionId = headId;
-    playSound('permission');
-  }
+  return row;
+}
+
+function permVerb(tool) {
+  if (tool === 'Bash' || tool === 'PowerShell') return t('permVerbBash');
+  if (tool === 'Edit' || tool === 'MultiEdit' || tool === 'NotebookEdit') return t('permVerbEdit');
+  if (tool === 'Write') return t('permVerbWrite');
+  if (tool === 'Read') return t('permVerbRead');
+  if (tool === 'WebFetch') return t('permVerbWeb');
+  if (tool === 'WebSearch') return t('permVerbSearch');
+  if (tool === 'Task' || tool === 'Agent') return t('permVerbAgent');
+  if (tool && tool.startsWith('mcp__')) return t('permVerbMcp');
+  return t('permVerbDefault');
 }
 
 function buildPermissionCard(p) {
-  // AskUserQuestion uses an entirely different schema: show the question(s) with selectable
-  // options, collect the user's picks, and send them back via approvePermission(_, 'allow', answers)
-  // which main-side wraps into hookSpecificOutput.decision.updatedInput.{questions, answers}.
-  if (p.toolName === 'AskUserQuestion' && Array.isArray(p.questions) && p.questions.length > 0) {
-    return buildAskUserCard(p);
-  }
-  const card = document.createElement('div');
-  card.className = 'permission-card';
-  const tool = document.createElement('div');
-  tool.className = 'permission-tool';
-  tool.textContent = String(p.toolName || '');
-  card.appendChild(tool);
+  const d = p.display || {};
+  const card = el('div', 'req');
+  card.dataset.id = p.id;
+  card.appendChild(sourceRow(p, 'a'));
 
-  if (p.toolInput) {
-    const inp = document.createElement('div');
-    inp.className = 'permission-input perm-tool-' + getToolColorClass(p.toolName);
-    const prefix = document.createElement('span');
-    prefix.className = 'perm-prefix';
-    if (p.toolName === 'Bash') {
-      prefix.textContent = '$ ';
-      prefix.style.color = 'var(--accent-green)';
-    } else if (p.toolName === 'Read') {
-      prefix.textContent = '📄 ';
-    } else if (p.toolName === 'Edit' || p.toolName === 'Write') {
-      prefix.textContent = '✏ ';
-    } else if (p.toolName === 'Grep' || p.toolName === 'Glob') {
-      prefix.textContent = '/ ';
-      prefix.style.color = 'var(--accent-purple)';
-    }
-    inp.appendChild(prefix);
-    const text = document.createElement('span');
-    text.textContent = String(p.toolInput).substring(0, 200);
-    inp.appendChild(text);
-    card.appendChild(inp);
-  }
+  const ttl = el('div', 'ttl');
+  ttl.appendChild(el('span', 'chip amber', t('permChip')));
+  ttl.appendChild(document.createTextNode(`${p.toolName} ${permVerb(p.toolName)}`));
+  card.appendChild(ttl);
 
-  const actions = document.createElement('div');
-  actions.className = 'permission-actions';
-  const mkBtn = (cls, label, behavior) => {
-    const b = document.createElement('button');
-    b.className = cls;
-    b.textContent = label;
-    b.addEventListener('click', () => {
-      window.codePeek.approvePermission(p.id, behavior);
-      dismissStickyPermission();
-    });
-    return b;
-  };
-  actions.appendChild(mkBtn('btn-allow', currentDict.btnAllow, 'allow'));
-  actions.appendChild(mkBtn('btn-deny', currentDict.btnDeny, 'deny'));
-  actions.appendChild(mkBtn('btn-always', currentDict.btnAlways, 'always'));
-  card.appendChild(actions);
-
-  return card;
-}
-
-// Renders a Claude AskUserQuestion permission card with rich question/option UI.
-// p.questions: array of { question, header, options[{label, description}], multiSelect }
-function buildAskUserCard(p) {
-  const card = document.createElement('div');
-  card.className = 'permission-card permission-card-askuser';
-
-  const tool = document.createElement('div');
-  tool.className = 'permission-tool';
-  tool.textContent = p.questions.length > 1
-    ? `${currentDict.tabAsk || 'Question'} (${p.questions.length})`
-    : (currentDict.tabAsk || 'Question');
-  card.appendChild(tool);
-
-  // Track user's selection per question index. Single-select stores a string; multi-select stores an array.
-  const selections = p.questions.map(q => q.multiSelect ? [] : null);
-
-  const submitBtn = document.createElement('button');
-  submitBtn.className = 'btn-allow';
-  submitBtn.textContent = currentDict.btnSubmit || 'Submit';
-  submitBtn.disabled = true;
-  const refreshSubmitState = () => {
-    const allAnswered = selections.every((sel, i) => {
-      if (p.questions[i].multiSelect) return Array.isArray(sel) && sel.length > 0;
-      return typeof sel === 'string' && sel.length > 0;
-    });
-    submitBtn.disabled = !allAnswered;
-  };
-
-  for (let qi = 0; qi < p.questions.length; qi++) {
-    const q = p.questions[qi];
-    const qBlock = document.createElement('div');
-    qBlock.className = 'askuser-question';
-    if (q.header) {
-      const h = document.createElement('div');
-      h.className = 'askuser-header';
-      h.textContent = String(q.header);
-      qBlock.appendChild(h);
-    }
-    const qt = document.createElement('div');
-    qt.className = 'askuser-text';
-    qt.textContent = String(q.question || '');
-    qBlock.appendChild(qt);
-
-    const optsWrap = document.createElement('div');
-    optsWrap.className = 'askuser-options';
-    const optionEls = [];
-    (q.options || []).forEach((opt) => {
-      const label = String(opt.label || '');
-      const desc = String(opt.description || '');
-      const btn = document.createElement('button');
-      btn.className = 'askuser-option';
-      const labelEl = document.createElement('div');
-      labelEl.className = 'askuser-option-label';
-      labelEl.textContent = label;
-      btn.appendChild(labelEl);
-      if (desc) {
-        const descEl = document.createElement('div');
-        descEl.className = 'askuser-option-desc';
-        descEl.textContent = desc;
-        btn.appendChild(descEl);
+  const code = el('div', 'code');
+  if (d.path) code.appendChild(el('div', 'path', d.path));
+  const body = d.command || d.detail || (!d.path ? p.toolInput : '');
+  let cmd = null;
+  if (body) {
+    cmd = el('div', 'cmd clamped');
+    if (p.toolName === 'Bash' || p.toolName === 'PowerShell') {
+      cmd.appendChild(el('span', 'ps', p.toolName === 'PowerShell' ? '>' : '$'));
+      cmd.appendChild(document.createTextNode(body));
+    } else if (d.detail && !d.command) {
+      for (const line of String(body).split('\n')) {
+        const ln = el('div', line.startsWith('- ') ? 'del' : line.startsWith('+ ') ? 'add' : '', line);
+        cmd.appendChild(ln);
       }
-      btn.addEventListener('click', () => {
-        if (q.multiSelect) {
-          const arr = selections[qi];
-          const idx = arr.indexOf(label);
-          if (idx >= 0) { arr.splice(idx, 1); btn.classList.remove('selected'); }
-          else { arr.push(label); btn.classList.add('selected'); }
-        } else {
-          selections[qi] = label;
-          optionEls.forEach(el => el.classList.remove('selected'));
-          btn.classList.add('selected');
-        }
-        refreshSubmitState();
-      });
-      optionEls.push(btn);
-      optsWrap.appendChild(btn);
+    } else {
+      cmd.textContent = body;
+    }
+    code.appendChild(cmd);
+  }
+  if (d.description) code.appendChild(el('div', 'desc', d.description));
+  if (code.children.length) card.appendChild(code);
+
+  if (cmd) {
+    const tools = el('div', 'code-tools');
+    const toggle = el('button', '', t('expandAll'));
+    toggle.style.display = 'none';
+    toggle.addEventListener('click', () => {
+      const clamped = cmd.classList.toggle('clamped');
+      toggle.textContent = clamped ? t('expandAll') : t('showLess');
     });
-    qBlock.appendChild(optsWrap);
-    card.appendChild(qBlock);
+    const copy = el('button', '', t('copy'));
+    copy.addEventListener('click', async () => {
+      try { await navigator.clipboard.writeText(body); copy.textContent = t('copied'); } catch {}
+      setTimeout(() => { copy.textContent = t('copy'); }, 1200);
+    });
+    tools.append(toggle, copy);
+    card.appendChild(tools);
+    requestAnimationFrame(() => { if (cmd.scrollHeight > cmd.clientHeight + 2) toggle.style.display = ''; });
   }
 
-  const actions = document.createElement('div');
-  actions.className = 'permission-actions';
-  submitBtn.addEventListener('click', () => {
-    if (submitBtn.disabled) return;
-    const answers = {};
-    for (let i = 0; i < p.questions.length; i++) {
-      answers[p.questions[i].question] = selections[i];
-    }
-    window.codePeek.approvePermission(p.id, 'allow', answers);
-    dismissStickyPermission();
-  });
-  const denyBtn = document.createElement('button');
-  denyBtn.className = 'btn-deny';
-  denyBtn.textContent = currentDict.btnDeny || 'Deny';
-  denyBtn.addEventListener('click', () => {
-    window.codePeek.approvePermission(p.id, 'deny');
-    dismissStickyPermission();
-  });
-  actions.appendChild(submitBtn);
-  actions.appendChild(denyBtn);
-  card.appendChild(actions);
-
+  const acts = el('div', 'acts');
+  if (p.alwaysLabel) {
+    const always = el('button', 'lnk');
+    always.appendChild(document.createTextNode(t('alwaysAllowFor') + ' '));
+    always.appendChild(el('code', '', p.alwaysLabel));
+    always.addEventListener('click', () => submitDecision(p, card, always, 'always'));
+    acts.appendChild(always);
+  }
+  acts.appendChild(el('span', 'sp'));
+  const later = el('button', 'btn text', t('btnLater'));
+  later.addEventListener('click', () => userCollapse('card'));
+  const deny = el('button', 'btn deny', t('btnDeny'));
+  deny.addEventListener('click', () => submitDecision(p, card, deny, 'deny'));
+  const allow = el('button', 'btn allow', t('btnAllowOnce'));
+  allow.addEventListener('click', () => submitDecision(p, card, allow, 'allow'));
+  acts.append(later, deny, allow);
+  card.appendChild(acts);
+  card.appendChild(el('div', 'result'));
   return card;
 }
 
-let _lastRenderedQuestionId = null;
-function renderQuestions(questions) {
-  if (questions.length === 0 && _questionStickyCard) {
-    questionsSection.style.display = 'block';
+const LOCAL_OUTCOME = { allow: 'allowed', always: 'allowed', deny: 'denied' };
+
+// Locks the card until the main process confirms; a failed send restores it instead of silently vanishing.
+async function submitDecision(p, card, btn, behavior, answers, message) {
+  if (submitting.has(p.id) || card.classList.contains('is-resolved')) return;
+  submitting.set(p.id, answers ? 'answered' : message ? 'clarify' : LOCAL_OUTCOME[behavior]);
+  const buttons = card.querySelectorAll('button');
+  buttons.forEach(b => { b.disabled = true; });
+  btn.classList.add('busy');
+  console.log(`[perm] submit id=${p.id} behavior=${behavior}`);
+  let res;
+  try {
+    res = await window.codePeek.approvePermission(p.id, behavior, answers || null, message || null);
+  } catch {
+    res = { ok: false, status: 'delivery-failed' };
+  }
+  btn.classList.remove('busy');
+  if (res && (res.ok || res.status === 'already-settled')) {
+    if (!livePerms().some(x => x.id === p.id) && !exiting.has(p.id) && !card.classList.contains('is-resolved')) startExit(p.id);
     return;
   }
-  questionsList.innerHTML = '';
-  if (questions.length === 0) {
-    questionsSection.style.display = 'none';
-    _lastRenderedQuestionId = null;
-    return;
+  submitting.delete(p.id);
+  if (!card.classList.contains('is-resolved')) buttons.forEach(b => { b.disabled = false; });
+  if (card._refresh) card._refresh();
+  showToast(t('submitFailed'), 'error');
+}
+
+// ---------- AskUserQuestion ----------
+function buildAskCard(p) {
+  const qs = p.questions;
+  const st = {
+    step: 0,
+    picks: qs.map(() => []),
+    other: qs.map(() => ''),
+    otherOn: qs.map(() => false)
+  };
+  const card = el('div', 'req');
+  card.dataset.id = p.id;
+  card.appendChild(sourceRow(p, 'b'));
+  const ttl = el('div', 'ttl');
+  const meta = el('div', 'ask-meta');
+  const opts = el('div', 'opts');
+  const foot = el('div', 'ask-foot');
+  card.append(ttl, meta, opts, foot, el('div', 'result'));
+
+  const answered = (i) => (st.otherOn[i] ? st.other[i].trim().length > 0 : st.picks[i].length > 0);
+  const answerOf = (i) => {
+    const labels = st.picks[i].slice();
+    if (st.otherOn[i] && st.other[i].trim()) labels.push(st.other[i].trim());
+    return qs[i].multiSelect ? labels : (labels[labels.length - 1] || '');
+  };
+  const submit = (btn) => {
+    if (!qs.every((_, i) => answered(i))) return;
+    const answers = {};
+    qs.forEach((q, i) => { answers[q.question] = answerOf(i); });
+    submitDecision(p, card, btn, 'allow', answers);
+  };
+
+  function draw() {
+    const i = st.step;
+    const q = qs[i];
+    ttl.textContent = '';
+    ttl.appendChild(el('span', 'qm', '?'));
+    if (q.header) ttl.appendChild(el('span', 'chip blue', q.header));
+    ttl.appendChild(document.createTextNode(String(q.question || '')));
+    const queue = card.querySelector('.queue');
+    if (queue) queue.textContent = qs.length > 1 ? fmt('askStep', { n: i + 1, total: qs.length }) : '';
+    meta.textContent = q.multiSelect ? t('askMulti') : '';
+    meta.style.display = q.multiSelect ? '' : 'none';
+
+    opts.textContent = '';
+    (q.options || []).forEach((opt, oi) => {
+      const label = String(opt.label || '');
+      const row = el('button', 'opt' + (q.multiSelect ? ' multi' : ''));
+      row.classList.toggle('sel', st.picks[i].includes(label));
+      row.appendChild(el('span', 'ix', `${oi + 1}.`));
+      const txt = el('div');
+      const ol = el('div', 'ol', label.replace(/\s*\((recommended|推荐)\)\s*$/i, ''));
+      if (/\((recommended|推荐)\)\s*$/i.test(label)) ol.appendChild(el('em', '', t('recommended')));
+      txt.appendChild(ol);
+      if (opt.description) txt.appendChild(el('div', 'od', opt.description));
+      row.appendChild(txt);
+      row.addEventListener('click', () => {
+        if (q.multiSelect) {
+          const at = st.picks[i].indexOf(label);
+          if (at >= 0) st.picks[i].splice(at, 1); else st.picks[i].push(label);
+        } else {
+          st.picks[i] = [label];
+          st.otherOn[i] = false;
+        }
+        draw();
+      });
+      opts.appendChild(row);
+    });
+    const other = el('div', 'opt other' + (q.multiSelect ? ' multi' : ''));
+    other.classList.toggle('sel', st.otherOn[i]);
+    other.appendChild(el('span', 'ix', '…'));
+    other.appendChild(el('div', 'ol', t('askOther')));
+    const ta = el('textarea');
+    ta.maxLength = 4000;
+    ta.placeholder = t('askOtherPlaceholder');
+    ta.value = st.other[i];
+    ta.addEventListener('click', e => e.stopPropagation());
+    ta.addEventListener('input', () => { st.other[i] = ta.value; refreshFoot(); });
+    ta.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && !composing) {
+        e.preventDefault();
+        if (i < qs.length - 1 && answered(i)) { st.step++; draw(); } else submit(foot.querySelector('.btn.allow'));
+      }
+    });
+    other.appendChild(ta);
+    other.addEventListener('click', () => {
+      st.otherOn[i] = q.multiSelect ? !st.otherOn[i] : true;
+      if (!q.multiSelect) st.picks[i] = [];
+      draw();
+      if (st.otherOn[i]) {
+        window.codePeek.focusWindow();
+        setTimeout(() => { const fresh = opts.querySelector('.opt.other textarea'); if (fresh) fresh.focus(); }, 0);
+      }
+    });
+    opts.appendChild(other);
+    drawFoot();
   }
-  questionsSection.style.display = 'block';
-  for (const q of questions) {
-    questionsList.appendChild(buildQuestionCard(q));
+
+  function drawFoot() {
+    const i = st.step;
+    foot.textContent = '';
+    if (qs[i].multiSelect) foot.appendChild(el('span', 'count', fmt('askSelected', { n: answerOfCount(i) })));
+    foot.appendChild(el('span', 'sp'));
+    const later = el('button', 'btn text', t('btnLater'));
+    later.addEventListener('click', () => userCollapse('card'));
+    const clarify = el('button', 'btn line', t('askClarify'));
+    clarify.addEventListener('click', () => {
+      const lines = qs.map((q, n) => `${n + 1}. ${q.question}`).join('\n');
+      submitDecision(p, card, clarify, 'deny', null,
+        `The user wants to discuss these questions in the conversation instead of picking an option.\n\nQuestions asked:\n${lines}`);
+    });
+    const skip = el('button', 'btn line', t('askSkip'));
+    skip.addEventListener('click', () => submitDecision(p, card, skip, 'deny'));
+    foot.append(later, clarify, skip);
+    if (i > 0) {
+      const prev = el('button', 'btn line', t('askPrev'));
+      prev.addEventListener('click', () => { st.step--; draw(); });
+      foot.appendChild(prev);
+    }
+    const last = i === qs.length - 1;
+    const next = el('button', 'btn allow', last ? (qs.length > 1 ? t('askSubmitAll') : t('askSubmit')) : t('askNext'));
+    next.disabled = !answered(i) || (last && !qs.every((_, n) => answered(n)));
+    next.addEventListener('click', () => {
+      if (!last) { st.step++; draw(); return; }
+      submit(next);
+    });
+    foot.appendChild(next);
   }
-  _questionStickyCard = questions[0];
-  // Play sound only when a new question card appears (not on every re-render).
-  const headId = questions[0]?.id;
-  if (headId && headId !== _lastRenderedQuestionId) {
-    _lastRenderedQuestionId = headId;
-    playSound('question');
+
+  function answerOfCount(i) {
+    return st.picks[i].length + (st.otherOn[i] && st.other[i].trim() ? 1 : 0);
+  }
+
+  function refreshFoot() {
+    const i = st.step;
+    const last = i === qs.length - 1;
+    const next = foot.querySelector('.btn.allow');
+    if (next && !submitting.has(p.id)) next.disabled = !answered(i) || (last && !qs.every((_, n) => answered(n)));
+    const count = foot.querySelector('.count');
+    if (count) count.textContent = fmt('askSelected', { n: answerOfCount(i) });
+  }
+
+  card._refresh = refreshFoot;
+  card._isAsk = true;
+  draw();
+  return card;
+}
+
+// ---------- Codex free-text question surface ----------
+function renderQuestionSurface() {
+  let focus = null;
+  for (const [, x] of exiting) if (x.surface === 'question') { focus = x.el; break; }
+  if (!focus) {
+    const qs = liveQuestions();
+    const q = qs.find(x => !snoozed.has(x.id)) || qs[0];
+    if (!q) { questionsList.textContent = ''; return; }
+    focus = requestCards.get(q.id) || buildQuestionCard(q);
+    requestCards.set(q.id, focus);
+  }
+  if (questionsList.firstElementChild !== focus) {
+    questionsList.textContent = '';
+    questionsList.appendChild(focus);
   }
 }
 
 function buildQuestionCard(q) {
-  const card = document.createElement('div');
-  card.className = 'question-card';
-
-  const txt = document.createElement('div');
-  txt.className = 'question-text';
-  txt.textContent = String(q.question || '');
-  card.appendChild(txt);
-
-  // If the question contains numbered options (lines starting with 1. 2. 3. etc),
-  // render them as clickable option buttons.
-  const optionLines = String(q.question || '').split('\n').filter(l => /^\s*\d+[\.\)]\s/.test(l));
-  if (optionLines.length >= 2) {
-    const optionsDiv = document.createElement('div');
-    optionsDiv.className = 'question-options';
-    for (const line of optionLines) {
-      const optBtn = document.createElement('div');
-      optBtn.className = 'question-option';
-      optBtn.textContent = line.trim();
-      optBtn.addEventListener('click', () => {
-        const num = line.match(/^\s*(\d+)/);
-        window.codePeek.answerQuestion(q.id, num ? num[1] : line.trim());
-        dismissStickyQuestion();
-      });
-      optBtn.addEventListener('mouseenter', () => optBtn.classList.add('hovered'));
-      optBtn.addEventListener('mouseleave', () => optBtn.classList.remove('hovered'));
-      optionsDiv.appendChild(optBtn);
-    }
-    card.appendChild(optionsDiv);
-  }
-
-  // Always show free-text input as fallback / "Other" option
-  const row = document.createElement('div');
-  row.className = 'question-input-row';
-
-  const input = document.createElement('input');
+  const card = el('div', 'req');
+  card.dataset.id = q.id;
+  card.appendChild(sourceRow(q, 'b'));
+  const ttl = el('div', 'ttl');
+  ttl.appendChild(el('span', 'chip blue', t('chipQuestion')));
+  card.appendChild(ttl);
+  card.appendChild(el('div', 'qtext', q.question || ''));
+  const row = el('div', 'acts');
+  const input = el('input', 'qinput');
   input.type = 'text';
-  input.className = 'question-input';
-  input.placeholder = currentDict.questionPlaceholder;
-  const send = () => {
+  input.placeholder = t('questionPlaceholder');
+  const send = el('button', 'btn allow', t('btnSend'));
+  const doSend = async () => {
     const v = input.value.trim();
-    if (v) { window.codePeek.answerQuestion(q.id, v); dismissStickyQuestion(); }
+    if (!v || submitting.has(q.id)) return;
+    submitting.set(q.id, 'answered');
+    send.disabled = true;
+    const res = await window.codePeek.answerQuestion(q.id, v).catch(() => ({ ok: false }));
+    if (!res || (!res.ok && res.status !== 'already-settled')) {
+      submitting.delete(q.id);
+      send.disabled = false;
+      showToast(t('submitFailed'), 'error');
+    }
   };
-  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') send(); });
-
-  const btn = document.createElement('button');
-  btn.className = 'btn-send';
-  btn.textContent = currentDict.btnSend;
-  btn.addEventListener('click', send);
-
-  row.appendChild(input);
-  row.appendChild(btn);
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.isComposing && !composing) doSend(); });
+  input.addEventListener('focus', () => window.codePeek.focusWindow());
+  send.addEventListener('click', doSend);
+  const later = el('button', 'btn text', t('btnLater'));
+  later.addEventListener('click', () => userCollapse('card'));
+  row.append(input, later, send);
   card.appendChild(row);
+  card.appendChild(el('div', 'result'));
   return card;
 }
 
-// ========== Actions ==========
+// ---------- Completion ----------
+function handleCompletion(data) {
+  if (!data) return;
+  const suppress = (why) => {
+    console.log(`[completion] suppressed: ${why}`);
+    completionBadge++;
+    renderHeader();
+  };
+  if (hasUnsnoozedPending()) return suppress('blocking request');
+  if (ui.settingsOpen) return suppress('settings open');
+  if (ui.expanded && ui.expandedBy !== 'event' && ui.surface === 'list') return suppress('user browsing');
+  if (!mouseInIsland && Date.now() - lastKeyAt < INPUT_ACTIVE_MS) return suppress('typing');
+  if (Date.now() - lastCompletionShownAt < COMPLETION_THROTTLE_MS) return suppress('throttled');
+  showCompletion(data);
+}
 
-async function handleSessionClick(card, event) {
-  const sid = card.dataset.sessionId;
-  if (event.shiftKey || event.ctrlKey) {
-    selectedSessionId = selectedSessionId === sid ? null : sid;
-    render();
-    return;
+function showCompletion(data) {
+  if (completion && completion.timer) clearTimeout(completion.timer);
+  completion = { data, timer: null, hover: false };
+  lastCompletionShownAt = Date.now();
+  playSound('complete');
+  console.log(`[completion] show: expanded=${ui.expanded}`);
+  completionBody.textContent = '';
+  reconcile();
+}
+
+function completionMs() {
+  return (currentConfig.completionDisplayTime || 5) * 1000;
+}
+
+function startCompletionTimer() {
+  if (!completion) return;
+  clearTimeout(completion.timer);
+  completion.timer = setTimeout(() => {
+    if (completion && completion.hover) return;
+    dismissCompletion();
+  }, completionMs());
+}
+
+function clearCompletion() {
+  if (completion && completion.timer) clearTimeout(completion.timer);
+  completion = null;
+  completionBody.textContent = '';
+}
+
+function dismissCompletion() {
+  console.log('[completion] dismiss');
+  clearCompletion();
+  reconcile();
+}
+
+function renderCompletion() {
+  if (!completion) { completionBody.textContent = ''; return; }
+  if (completionBody.firstElementChild && completionBody.firstElementChild._data === completion.data) return;
+  const d = completion.data;
+  const card = el('div', 'done');
+  card._data = d;
+  card.style.setProperty('--countdown', completionMs() + 'ms');
+  const ok = el('div', 'ok');
+  ok.appendChild(icon('E73E'));
+  const body = el('div');
+  body.style.minWidth = '0';
+  const t1 = el('div', 't1');
+  t1.appendChild(el('span', 'chip green', t('completionDone')));
+  t1.appendChild(el('span', 'name', (d.projectName || d.sessionTitle || t('completionUntitled')).trim()));
+  if (d.gitBranch) t1.appendChild(el('span', 'branch', `⑂ ${d.gitBranch}`));
+  body.appendChild(t1);
+  const summary = (d.lastResponse || d.sessionTitle || d.cwd || '').toString().trim();
+  if (summary) body.appendChild(el('div', 't2', summary));
+  const view = el('span', 'term');
+  view.appendChild(icon('E8A7'));
+  view.appendChild(document.createTextNode(t('completionView')));
+  card.append(ok, body, view, el('div', 'bar'));
+  card.addEventListener('mouseenter', () => { if (completion) { completion.hover = true; clearTimeout(completion.timer); } });
+  card.addEventListener('mouseleave', () => { if (completion) { completion.hover = false; startCompletionTimer(); } });
+  card.addEventListener('click', () => {
+    const snap = completion && completion.data;
+    clearCompletion();
+    collapse('completion-click');
+    if (snap) jumpToSession(snap.sessionId, snap);
+  });
+  completionBody.textContent = '';
+  completionBody.appendChild(card);
+  startCompletionTimer();
+}
+
+// ========== Clocks ==========
+function tickClocks() {
+  const now = Date.now();
+  const nodes = [];
+  if (indicator.classList.contains('mode-pill') && pillTime.dataset.since) nodes.push(pillTime);
+  if (ui.expanded) island.querySelectorAll('.panel [data-since]').forEach(n => nodes.push(n));
+  for (const n of nodes) {
+    const sec = Math.max(0, Math.floor((now - Number(n.dataset.since)) / 1000));
+    n.textContent = sec >= 3600 ? `${Math.floor(sec / 3600)}h${String(Math.floor(sec % 3600 / 60)).padStart(2, '0')}`
+      : `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}`;
   }
-  selectedSessionId = sid;
-  render();
-
-  const isRunning = card.dataset.isRunning !== 'false';
-  const cwd = card.dataset.cwd || '';
-
-  if (!isRunning) {
-    // Stale session: launch a new terminal tab running `<cli> resume`.
-    showToast(currentDict.reopening || 'Reopening...', 'success');
-    const agent = card.dataset.agent || 'claude';
-    const result = await window.codePeek.launchSession(sid, cwd, agent);
-    if (result.success) {
-      showToast(currentDict.reopenOk || 'Reopened', 'success');
-    } else {
-      showToast(`${currentDict.reopenFailed || 'Reopen failed'}: ${result.error || 'Unknown'}`, 'error');
-    }
-    return;
-  }
-
-  // Active session: focus the existing terminal tab.
-  let pid = parseInt(card.dataset.pid || '0');
-  const sessionName = card.dataset.sessionName || '';
-
-  // Codex/other sessions spawned by Claude (via plugin) lack a PID.
-  // Fall back to the parent Claude session with the same cwd.
-  const agent = card.dataset.agent || 'claude';
-  if (!pid && cwd) {
-    // Prefer a session from a different agent type (e.g. Codex click → find Claude parent).
-    const parent = (currentState.sessions || []).find(s =>
-      s.pid && s.isRunning !== false && s.cwd === cwd && s.agent !== agent
-    ) || (currentState.sessions || []).find(s =>
-      s.pid && s.isRunning !== false && s.cwd === cwd
-    );
-    if (parent) pid = parent.pid;
-  }
-
-  if (!pid) { showToast(currentDict.menuNoPid, 'error'); return; }
-  showToast(currentDict.menuJumping, 'success');
-  const result = await window.codePeek.jumpToTerminal(pid, sessionName, cwd);
-  if (result.success) showToast(currentDict.menuSwitched, 'success');
-  else {
-    // NO_WINDOW / No ancestors usually mean the terminal was closed.
-    const err = result.error || '';
-    if (/NO_WINDOW|No ancestors/i.test(err)) {
-      showToast(currentDict.sessionClosed || 'Terminal closed — refreshing', 'error');
-    } else {
-      showToast(`${currentDict.menuJumpFailed}: ${err || 'Unknown'}`, 'error');
+  if (ui.expanded && ui.surface === 'list') {
+    for (const [id, c] of sessionCards) {
+      const s = currentState.sessions.find(x => x.id === id);
+      if (s) c.refs.time.textContent = formatTimeAgo(s.lastActivity || s.lastActivityAt || s.startedAt);
     }
   }
 }
 
-// Permission / question button handlers are bound inside buildPermissionCard / buildQuestionCard.
+// ========== Actions ==========
+async function handleSessionClick(sessionId, event) {
+  const s = currentState.sessions.find(x => x.id === sessionId);
+  if (!s) return;
+  if (event.shiftKey || event.ctrlKey) {
+    selectedSessionId = selectedSessionId === sessionId ? null : sessionId;
+    render();
+    return;
+  }
+  if (liveRequests().some(r => r.sessionId === sessionId)) { openRequests(sessionId); return; }
+  if (s.isRunning === false) {
+    showToast(t('reopening'), 'success');
+    const result = await window.codePeek.launchSession(s.id, s.cwd || '', s.agent || 'claude');
+    showToast(result && result.success ? t('reopenOk') : `${t('reopenFailed')}: ${(result && result.error) || 'Unknown'}`,
+      result && result.success ? 'success' : 'error');
+    return;
+  }
+  jumpToSession(sessionId);
+}
 
-// ========== Sound playback ==========
+// Codex sessions spawned by Claude have no PID of their own; fall back to a live session in the same cwd.
+async function jumpToSession(sessionId, snapshot) {
+  let sessions = currentState.sessions;
+  try { sessions = (await window.codePeek.getState()).sessions || sessions; } catch {}
+  const s = sessions.find(x => x.id === sessionId) || {};
+  const cwd = (s.cwd || (snapshot && snapshot.cwd) || '').toString();
+  const agent = s.agent || (snapshot && snapshot.agent) || '';
+  let pid = s.pid;
+  if (!pid && cwd) {
+    const parent = sessions.find(x => x.pid && x.isRunning !== false && x.cwd === cwd && x.agent !== agent)
+      || sessions.find(x => x.pid && x.isRunning !== false && x.cwd === cwd);
+    if (parent) pid = parent.pid;
+  }
+  if (!pid) { showToast(t('menuNoPid'), 'error'); return; }
+  const name = (s.name || (snapshot && (snapshot.sessionTitle || snapshot.projectName)) || '').toString();
+  const result = await window.codePeek.jumpToTerminal(pid, name, cwd);
+  if (!result || !result.success) {
+    const err = (result && result.error) || '';
+    showToast(/NO_WINDOW|No ancestors/i.test(err) ? t('sessionClosed') : `${t('menuJumpFailed')}: ${err || 'Unknown'}`, 'error');
+  }
+}
 
 function playSound(type) {
   if (!currentConfig.soundEnabled) return;
@@ -1240,220 +1368,308 @@ function playSound(type) {
   if (keyMap[type] && !currentConfig[keyMap[type]]) return;
   const url = currentSounds[type];
   if (!url) return;
-  const vol = currentConfig.soundVolume || 0.5;
   audio.src = url;
-  audio.volume = vol;
+  audio.volume = currentConfig.soundVolume || 0.5;
   audio.play().catch(() => {});
 }
 
-// ========== Context menu ==========
+// ========== Config / i18n / theme ==========
+function applyConfigToUI() {
+  const root = document.documentElement.style;
+  const fs = Number(currentConfig.fontSize) || 13;
+  root.setProperty('--fs', fs + 'px');
+  root.setProperty('--response-lines', currentConfig.responseLines || 2);
+  const peek = typeof currentConfig.peekHeight === 'number' ? currentConfig.peekHeight : 5;
+  root.setProperty('--peek-height', peek + 'px');
+  const ph = Number(currentConfig.panelHeight) > 0 ? Number(currentConfig.panelHeight) : 560;
+  root.setProperty('--content-max-height', Math.max(200, ph - 62) + 'px');
+  const ease = EASINGS[currentConfig.animationEasing] || EASINGS.snappy;
+  root.setProperty('--dur-open', durOpen() + 'ms');
+  root.setProperty('--dur-close', durClose() + 'ms');
+  root.setProperty('--ease-open', ease[0]);
+  root.setProperty('--ease-close', ease[1]);
+  applyAccent();
+  applyMotionPreference();
+  pillKey = '';
+}
+
+function applyMotionPreference() {
+  const sys = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  reducedMotion = sys || currentConfig.reduceMotion === true;
+  document.documentElement.classList.toggle('reduced', reducedMotion);
+  MascotClock.setReduced(reducedMotion);
+}
+
+// Dark accents (e.g. default Windows blue) are lifted so links and indicators stay legible on near-black.
+function applyAccent() {
+  let color = (currentConfig.followAccent !== false && accentColor) ? accentColor : DEFAULT_ACCENT;
+  const m = /^#([0-9a-f]{6})$/i.exec(color || '');
+  if (!m) color = DEFAULT_ACCENT;
+  else {
+    let [r, g, b] = [0, 2, 4].map(i => parseInt(m[1].substr(i, 2), 16));
+    const lum = (v) => { v /= 255; return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); };
+    let k = 0;
+    while (0.2126 * lum(r) + 0.7152 * lum(g) + 0.0722 * lum(b) < 0.28 && k < 10) {
+      r = Math.round(r + (255 - r) * 0.18); g = Math.round(g + (255 - g) * 0.18); b = Math.round(b + (255 - b) * 0.18);
+      k++;
+    }
+    color = '#' + [r, g, b].map(v => v.toString(16).padStart(2, '0')).join('');
+  }
+  document.documentElement.style.setProperty('--accent', color);
+}
+
+function applyI18n() {
+  document.documentElement.lang = (currentDict.statusIdle === '空闲') ? 'zh-CN' : 'en';
+  $('titleText').textContent = t('appName', 'CodePeek');
+  document.querySelectorAll('[data-i18n]').forEach(n => {
+    const v = currentDict[n.dataset.i18n];
+    if (v) n.textContent = v;
+  });
+  if (ui.settingsOpen) updateHookStatus();
+  renderHeader();
+}
+
+// ========== Mouse handling ==========
+// Passthrough: outside the island the transparent window ignores the mouse but still forwards moves.
+let lastIgnore = null;
+function syncIgnoreMouse() {
+  const ignore = !mouseInIsland;
+  if (ignore === lastIgnore) return;
+  lastIgnore = ignore;
+  window.codePeek.setIgnoreMouse(ignore);
+}
+
+function updateMouseInIsland(inside) {
+  if (inside === mouseInIsland) return;
+  mouseInIsland = inside;
+  syncIgnoreMouse();
+  if (inside) {
+    if (ui.expandedBy === 'event') ui.expandedBy = 'hover';
+    scheduleExpand('hover');
+  } else {
+    scheduleCollapse();
+    if (lastLayout && ui.surface === 'list') render();
+  }
+}
+
+island.addEventListener('mouseenter', () => updateMouseInIsland(true));
+island.addEventListener('mouseleave', () => updateMouseInIsland(false));
+island.addEventListener('mousemove', () => { if (!mouseInIsland) updateMouseInIsland(true); });
+
+function interactiveRect() {
+  if (ui.expanded) {
+    const r = panel.getBoundingClientRect();
+    return { left: r.left - 14, right: r.right + 14, top: 0, bottom: r.bottom + 2 };
+  }
+  const target = indicator.classList.contains('mode-pill') ? pill : stripHit;
+  const r = target.getBoundingClientRect();
+  return { left: r.left - 10, right: r.right + 10, top: 0, bottom: r.bottom + 2 };
+}
+
+// mouseleave can be lost while passthrough toggles, so the real cursor position is polled while inside.
+let safetyPollInFlight = false;
+async function safetyPoll() {
+  if (!mouseInIsland || safetyPollInFlight || document.querySelector('select:focus')) return;
+  safetyPollInFlight = true;
+  try {
+    const { screenX, screenY, winBounds } = await window.codePeek.getCursorScreenPoint();
+    if (!mouseInIsland || !winBounds) return;
+    const x = screenX - winBounds.x;
+    const y = screenY - winBounds.y;
+    const r = interactiveRect();
+    if (x < r.left || x > r.right || y < r.top || y > r.bottom) updateMouseInIsland(false);
+  } catch {} finally {
+    safetyPollInFlight = false;
+  }
+}
+
+pill.addEventListener('click', () => {
+  clearTimeout(hoverExpandTimer);
+  hoverExpandTimer = null;
+  if (liveRequests().length) openRequests(null);
+  else expand('click');
+});
+stripHit.addEventListener('click', () => {
+  clearTimeout(hoverExpandTimer);
+  hoverExpandTimer = null;
+  if (liveRequests().length) openRequests(null);
+  else expand('click');
+});
+
+// Header drag moves the native window horizontally; the final offset is persisted on mouseup.
+let drag = null;
+hdrMain.addEventListener('mousedown', (e) => {
+  if (e.button !== 0 || e.target.closest('button')) return;
+  drag = { startX: e.screenX, dx: 0, moved: false, raf: 0, applied: null };
+  e.preventDefault();
+});
+window.addEventListener('mousemove', (e) => {
+  if (!drag) return;
+  drag.dx = e.screenX - drag.startX;
+  if (!drag.moved && Math.abs(drag.dx) < 6) return;
+  drag.moved = true;
+  if (drag.raf) return;
+  drag.raf = requestAnimationFrame(() => {
+    if (!drag) return;
+    drag.raf = 0;
+    const d = drag;
+    window.codePeek.dragWindow(d.dx).then(applied => { if (typeof applied === 'number') d.applied = applied; }).catch(() => {});
+  });
+});
+window.addEventListener('mouseup', () => {
+  if (!drag) return;
+  const d = drag;
+  drag = null;
+  if (!d.moved) return;
+  window.codePeek.dragWindow(d.dx).then(applied => {
+    const offset = typeof applied === 'number' ? applied : (d.applied !== null ? d.applied : (Number(currentConfig.panelOffsetX) || 0) + Math.round(d.dx));
+    window.codePeek.setConfig({ panelOffsetX: offset });
+  }).catch(() => {});
+});
+
+groupTabs.addEventListener('click', (e) => {
+  const b = e.target.closest('.tab');
+  if (!b) return;
+  lastLayout = null;
+  window.codePeek.setConfig({ sessionGrouping: b.dataset.group });
+});
+btnCollapse.addEventListener('click', (e) => { e.stopPropagation(); userCollapse('button'); });
+btnPin.addEventListener('click', (e) => {
+  e.stopPropagation();
+  ui.pinned = !ui.pinned;
+  if (ui.pinned && !ui.expanded) expand('click');
+  showToast(ui.pinned ? t('toastPinned') : t('toastUnpinned'), 'success');
+  renderHeader();
+});
+btnMute.addEventListener('click', (e) => {
+  e.stopPropagation();
+  window.codePeek.setConfig({ soundEnabled: !currentConfig.soundEnabled });
+});
+btnSettings.addEventListener('click', (e) => {
+  e.stopPropagation();
+  if (ui.settingsOpen) closeSettings(); else openSettings();
+});
+btnBack.addEventListener('click', () => closeSettings());
+pendingBanner.addEventListener('click', () => {
+  closeSettings();
+  openRequests(null);
+});
+
+function onKeyDown(e) {
+  lastKeyAt = Date.now();
+  if (e.key !== 'Escape' || e.isComposing || composing) return;
+  if (ui.settingsOpen) closeSettings();
+  else if (ui.expanded) userCollapse('esc');
+}
 
 island.addEventListener('contextmenu', (e) => {
   e.preventDefault();
-  const existing = document.querySelector('.context-menu');
-  if (existing) existing.remove();
-
-  const menu = document.createElement('div');
-  menu.className = 'context-menu';
-  menu.innerHTML = `
-    <div class="context-item" id="ctxSettings">${currentDict.menuSettings}</div>
-    <div class="context-divider"></div>
-    <div class="context-item danger" id="ctxQuit">${currentDict.menuQuit}</div>
-  `;
+  document.querySelectorAll('.context-menu').forEach(m => m.remove());
+  const menu = el('div', 'context-menu');
+  const settings = el('div', 'context-item', t('menuSettings'));
+  const quit = el('div', 'context-item danger', t('menuQuit'));
+  menu.append(settings, el('div', 'context-divider'), quit);
   menu.style.left = Math.min(e.clientX, window.innerWidth - 180) + 'px';
   menu.style.top = Math.min(e.clientY, window.innerHeight - 100) + 'px';
   document.body.appendChild(menu);
-
-  menu.querySelector('#ctxSettings').onclick = () => { menu.remove(); openSettings(); };
-  menu.querySelector('#ctxQuit').onclick = () => { menu.remove(); window.codePeek.quitApp(); };
-
+  settings.onclick = () => { menu.remove(); openSettings(); };
+  quit.onclick = () => { menu.remove(); window.codePeek.quitApp(); };
   setTimeout(() => {
     const close = () => { menu.remove(); document.removeEventListener('click', close); };
     document.addEventListener('click', close);
   }, 0);
 });
 
-// ========== Mouse events ==========
-
-// Mouse-passthrough state machine:
-//  - modal open                       -> must NOT passthrough (so modal buttons are clickable)
-//  - modal closed + mouse over island -> do not passthrough (normal interaction)
-//  - modal closed + mouse outside     -> passthrough (clicks fall through to desktop / windows below)
-function syncIgnoreMouse(mouseInIsland) {
-  const shouldIgnore = !isModalOpen() && !mouseInIsland;
-  window.codePeek.setIgnoreMouse(shouldIgnore);
-}
-
-// mouseenter/mouseleave can be lost when the window toggles ignoreMouseEvents,
-// so continuously track "is mouse inside island" via mousemove as the primary signal.
-let mouseInIsland = false;
-
-function updateMouseInIsland(inside) {
-  if (inside === mouseInIsland) return;
-  mouseInIsland = inside;
-  syncIgnoreMouse(inside);
-  if (inside) scheduleExpand();
-  else scheduleCollapse();
-}
-
-island.addEventListener('mouseenter', () => updateMouseInIsland(true));
-island.addEventListener('mouseleave', () => updateMouseInIsland(false));
-island.addEventListener('mousemove', () => {
-  if (!mouseInIsland) updateMouseInIsland(true);
-});
-
-// Safety poll every 200ms: only active when the island is EXPANDED.
-// Uses screen.getCursorScreenPoint() from the main process — this works regardless
-// of setIgnoreMouseEvents state (unlike renderer mousemove which can stop updating).
-let _safetyPollInFlight = false;
-setInterval(async () => {
-  if (!mouseInIsland || !isExpanded || _safetyPollInFlight) return;
-  _safetyPollInFlight = true;
-  try {
-    const { screenX, screenY, winBounds } = await window.codePeek.getCursorScreenPoint();
-    if (!mouseInIsland || !isExpanded || !winBounds) return; // state may have changed during IPC
-    // Convert screen coordinates to window-relative coordinates.
-    const clientX = screenX - winBounds.x;
-    const clientY = screenY - winBounds.y;
-    const rect = island.getBoundingClientRect();
-    if (clientX < rect.left || clientX > rect.right || clientY < rect.top || clientY > rect.bottom) {
-      updateMouseInIsland(false);
-    }
-  } catch {} finally {
-    _safetyPollInFlight = false;
-  }
-}, 200);
-
-let lastMouseX = -1, lastMouseY = -1;
-window.addEventListener('mousemove', (e) => {
-  lastMouseX = e.clientX;
-  lastMouseY = e.clientY;
-});
-
-// ========== Click handlers ==========
-
-header.addEventListener('mousedown', (e) => {
-  if (e.button === 0 && isExpanded && !e.target.closest('.header-actions')) {
-    onDragStart(e);
-  }
-});
-window.addEventListener('mousemove', (e) => { if (_dragState) onDragMove(e); });
-window.addEventListener('mouseup', (e) => { if (_dragState) onDragEnd(e); });
-
-header.addEventListener('click', (e) => {
-  if (e.target.closest('.header-actions')) return;
-  if (isExpanded && manuallyPinned) {
-    manuallyPinned = false;
-    collapse();
-  } else if (isExpanded && !manuallyPinned) {
-    manuallyPinned = true;
-    showToast(currentDict.menuPin, 'success');
-  } else {
-    manuallyPinned = true;
-    expand();
-  }
-});
-
-btnCollapse.addEventListener('click', (e) => {
-  e.stopPropagation();
-  manuallyPinned = false;
-  collapse();
-});
-
-btnSettings.addEventListener('click', (e) => { e.stopPropagation(); openSettings(); });
-btnSettingsClose.addEventListener('click', closeSettings);
-settingsModal.addEventListener('click', (e) => { if (e.target === settingsModal) closeSettings(); });
-
-// ========== Settings panel ==========
-
+// ========== Settings ==========
 function openSettings() {
-  if (!isExpanded) { manuallyPinned = true; expand(); }
-  settingsModal.style.display = 'flex';
-  // Modal opened: force passthrough OFF, otherwise button clicks fall through to the window below.
-  window.codePeek.setIgnoreMouse(false);
+  ui.settingsOpen = true;
+  if (!ui.expanded) expand('settings');
+  window.codePeek.focusWindow();
+  syncIgnoreMouse();
   populateSettings();
+  setSurface('settings');
+  render();
 }
 
-function closeSettings() {
-  settingsModal.style.display = 'none';
-  // Modal closed: reset to passthrough; next time the mouse hits the island, mouseenter flips it back off.
-  syncIgnoreMouse(false);
+function closeSettings(fromCollapse) {
+  if (!ui.settingsOpen) return;
+  ui.settingsOpen = false;
+  destroyGallery();
+  if (document.activeElement && island.contains(document.activeElement)) document.activeElement.blur();
+  syncIgnoreMouse();
+  if (fromCollapse) return;
+  if (ui.expandedBy === 'settings') ui.expandedBy = mouseInIsland ? 'hover' : 'event';
+  reconcile();
 }
+
+document.querySelectorAll('#setNav button').forEach(b => {
+  b.addEventListener('click', () => {
+    document.querySelectorAll('#setNav button').forEach(x => x.classList.toggle('on', x === b));
+    document.querySelectorAll('.pane').forEach(p => p.classList.toggle('on', p.dataset.pane === b.dataset.pane));
+    if (b.dataset.pane === 'appearance') renderMascotGallery(); else destroyGallery();
+  });
+});
 
 function populateSettings() {
-  // General
-  document.getElementById('selLang').value = currentConfig.language || 'auto';
-  document.getElementById('chkStartOnLogin').checked = currentConfig.startOnLogin;
-
-  const selDisplay = document.getElementById('selDisplay');
-  selDisplay.innerHTML = '';
+  $('selLang').value = currentConfig.language || 'auto';
+  $('chkStartOnLogin').checked = !!currentConfig.startOnLogin;
+  const selDisplay = $('selDisplay');
+  selDisplay.textContent = '';
   for (const d of currentDisplays) {
-    const opt = document.createElement('option');
+    const opt = el('option', '', `${d.label || 'Display ' + d.id}${d.primary ? ' (' + t('displayPrimary') + ')' : ''}`);
     opt.value = String(d.id);
-    opt.textContent = `${d.label || 'Display ' + d.id}${d.primary ? ' (Primary)' : ''}`;
     selDisplay.appendChild(opt);
   }
-  selDisplay.value = currentConfig.displayId || (currentDisplays.find(d => d.primary)?.id || '');
+  selDisplay.value = String(currentConfig.displayId || (currentDisplays.find(d => d.primary) || {}).id || '');
 
-  // Behavior
-  document.getElementById('chkAutoHide').checked = currentConfig.autoHidePanel;
-  document.getElementById('chkHoverExpand').checked = currentConfig.hoverExpand;
-  const hed = document.getElementById('rangeHoverExpandDelay');
-  hed.value = currentConfig.hoverExpandDelay;
-  document.getElementById('valHoverExpandDelay').textContent = hed.value + 'ms';
-  const hcd = document.getElementById('rangeHoverCollapseDelay');
-  hcd.value = currentConfig.hoverCollapseDelay;
-  document.getElementById('valHoverCollapseDelay').textContent = hcd.value + 'ms';
-  const rct = document.getElementById('rangeCompletionTime');
-  rct.value = currentConfig.completionDisplayTime || 5;
-  document.getElementById('valCompletionTime').textContent = rct.value + 's';
-  document.getElementById('chkSuppressNotif').checked = currentConfig.suppressNotifications;
-  document.getElementById('numCleanup').value = currentConfig.cleanupStaleAfter;
+  $('chkAutoHide').checked = !!currentConfig.autoHidePanel;
+  $('chkHoverExpand').checked = !!currentConfig.hoverExpand;
+  setRange('rangeHoverExpandDelay', 'valHoverExpandDelay', currentConfig.hoverExpandDelay, 'ms');
+  setRange('rangeHoverCollapseDelay', 'valHoverCollapseDelay', currentConfig.hoverCollapseDelay, 'ms');
+  setRange('rangeCompletionTime', 'valCompletionTime', currentConfig.completionDisplayTime || 5, 's');
+  $('chkSuppressNotif').checked = !!currentConfig.suppressNotifications;
+  $('numCleanup').value = currentConfig.cleanupStaleAfter;
 
-  // Appearance
-  const sw = document.getElementById('rangePanelWidth');
-  sw.value = currentConfig.panelWidth;
-  document.getElementById('valPanelWidth').textContent = sw.value + 'px';
+  setRange('rangePanelWidth', 'valPanelWidth', currentConfig.panelWidth, 'px');
+  setRange('rangePanelHeight', 'valPanelHeight', currentConfig.panelHeight, 'px');
+  setRange('rangeFontSize', 'valFontSize', currentConfig.fontSize, 'px');
+  $('numRespLines').value = currentConfig.responseLines;
+  $('chkMascots').checked = currentConfig.mascotEnabled !== false;
+  setRange('rangePeekHeight', 'valPeekHeight', currentConfig.peekHeight, 'px');
+  $('chkFollowAccent').checked = currentConfig.followAccent !== false;
+  $('chkReduceMotion').checked = currentConfig.reduceMotion === true;
+  setRange('rangeAnimDuration', 'valAnimDuration', durOpen(), 'ms');
+  const easing = EASINGS[currentConfig.animationEasing] ? currentConfig.animationEasing : 'snappy';
+  document.querySelectorAll('#segAnimEasing span').forEach(s => s.classList.toggle('on', s.dataset.v === easing));
+  const mode = currentConfig.collapsedMode || 'smart';
+  document.querySelectorAll('#segCollapsedMode span').forEach(s => s.classList.toggle('on', s.dataset.v === mode));
 
-  const sh = document.getElementById('rangePanelHeight');
-  sh.value = currentConfig.panelHeight;
-  document.getElementById('valPanelHeight').textContent = sh.value + 'px';
-
-  const sf = document.getElementById('rangeFontSize');
-  sf.value = currentConfig.fontSize;
-  document.getElementById('valFontSize').textContent = sf.value + 'px';
-
-  document.getElementById('numRespLines').value = currentConfig.responseLines;
-  document.getElementById('chkMascots').checked = currentConfig.mascotEnabled;
-
-  const rp = document.getElementById('rangePeekHeight');
-  rp.value = currentConfig.peekHeight;
-  document.getElementById('valPeekHeight').textContent = rp.value + 'px';
-
-  // Sound
-  document.getElementById('chkSoundEnabled').checked = currentConfig.soundEnabled;
-  // Populate the sound-pack dropdown
+  $('chkSoundEnabled').checked = !!currentConfig.soundEnabled;
   window.codePeek.getSoundPacks().then(packs => {
-    const sel = document.getElementById('selSoundPack');
+    const sel = $('selSoundPack');
     const labels = { soft: 'Soft (Sine)', chime: 'Chime (Bells)', '8bit': '8-bit Retro', minimal: 'Minimal', silent: 'Silent' };
-    sel.innerHTML = packs.map(p => `<option value="${p}">${labels[p] || p}</option>`).join('');
+    sel.textContent = '';
+    for (const p of packs) {
+      const o = el('option', '', labels[p] || p);
+      o.value = p;
+      sel.appendChild(o);
+    }
     sel.value = currentConfig.soundPack || 'soft';
   });
-  const rv = document.getElementById('rangeVolume');
-  rv.value = Math.round(currentConfig.soundVolume * 100);
-  document.getElementById('valVolume').textContent = rv.value + '%';
-  document.getElementById('chkSndSessionStart').checked = currentConfig.soundOnSessionStart;
-  document.getElementById('chkSndToolUse').checked = currentConfig.soundOnToolUse;
-  document.getElementById('chkSndPermission').checked = currentConfig.soundOnPermission;
-  document.getElementById('chkSndQuestion').checked = currentConfig.soundOnQuestion;
-  document.getElementById('chkSndComplete').checked = currentConfig.soundOnComplete;
+  setRange('rangeVolume', 'valVolume', Math.round((currentConfig.soundVolume || 0) * 100), '%');
+  for (const n of ['SessionStart', 'ToolUse', 'Permission', 'Question', 'Complete']) {
+    $('chkSnd' + n).checked = !!currentConfig['soundOn' + n];
+  }
 
-  // Hooks
   updateHookStatus();
   renderAgentList();
+  if (document.querySelector('#setNav button.on').dataset.pane === 'appearance') renderMascotGallery();
+}
 
-  // Mascots
-  renderMascotGallery();
+function setRange(id, valId, value, unit) {
+  const r = $(id);
+  if (value !== undefined && value !== null) r.value = value;
+  $(valId).textContent = r.value + unit;
 }
 
 async function updateHookStatus() {
@@ -1461,304 +1677,148 @@ async function updateHookStatus() {
     window.codePeek.isHooksInstalled(),
     window.codePeek.isCodexHooksInstalled()
   ]);
-  // Claude
-  document.getElementById('hookStatusText').textContent = claudeOk ? currentDict.installed : currentDict.notInstalled;
-  const cb = document.getElementById('btnToggleHooks');
-  cb.textContent = claudeOk ? currentDict.btnUninstall : currentDict.btnInstall;
-  cb.classList.toggle('installed', claudeOk);
-  // Codex
-  document.getElementById('codexHookStatusText').textContent = codexOk ? currentDict.installed : currentDict.notInstalled;
-  const xb = document.getElementById('btnToggleCodexHooks');
-  xb.textContent = codexOk ? currentDict.btnUninstall : currentDict.btnInstall;
-  xb.classList.toggle('installed', codexOk);
+  hooksInstalled = claudeOk;
+  $('hookStatusText').textContent = claudeOk ? t('installed') : t('notInstalled');
+  $('btnToggleHooks').textContent = claudeOk ? t('btnUninstall') : t('btnInstall');
+  $('codexHookStatusText').textContent = codexOk ? t('installed') : t('notInstalled');
+  $('btnToggleCodexHooks').textContent = codexOk ? t('btnUninstall') : t('btnInstall');
 }
 
 function renderAgentList() {
-  const list = document.getElementById('agentList');
-  list.innerHTML = '';
+  const list = $('agentList');
+  list.textContent = '';
   for (const a of currentAgents) {
-    const row = document.createElement('div');
-    row.className = 'agent-row';
-
-    const badge = document.createElement('span');
-    badge.className = 'agent-badge';
+    const row = el('div', 'agent-row');
+    const badge = el('span', 'agent-badge');
     badge.style.background = sanitizeColor(a.color);
-    if (a.iconSvg) {
-      badge.innerHTML = `<svg viewBox="0 0 24 24" width="16" height="16" style="color:#fff">${a.iconSvg}</svg>`;
-    } else {
-      badge.textContent = a.icon || '?';
-    }
-    row.appendChild(badge);
-
-    const nameEl = document.createElement('span');
-    nameEl.className = 'agent-name';
-    nameEl.textContent = a.name;
-    if (!a.supported) {
-      const tag = document.createElement('span');
-      tag.className = 'coming-soon';
-      tag.textContent = 'Coming soon';
-      nameEl.appendChild(tag);
-    }
-    row.appendChild(nameEl);
-
-    const sw = document.createElement('label');
-    sw.className = 'switch';
-    const inp = document.createElement('input');
+    if (a.iconSvg) badge.innerHTML = `<svg viewBox="0 0 24 24" width="14" height="14" style="color:#fff">${a.iconSvg}</svg>`;
+    else badge.textContent = a.icon || '?';
+    const name = el('span', 'agent-name', a.name);
+    if (!a.supported) name.appendChild(el('span', 'coming-soon', 'Coming soon'));
+    const sw = el('label', 'switch');
+    const inp = el('input');
     inp.type = 'checkbox';
-    inp.checked = !!(currentConfig.agents && currentConfig.agents[a.id]);
-    if (!a.supported) {
-      inp.disabled = true;
-      inp.checked = false;
-    }
+    inp.checked = !!(a.supported && currentConfig.agents && currentConfig.agents[a.id]);
+    inp.disabled = !a.supported;
     inp.addEventListener('change', () => {
-      if (!a.supported) return;
       const agents = { ...(currentConfig.agents || {}) };
       agents[a.id] = inp.checked;
       window.codePeek.setConfig({ agents });
     });
-    const slider = document.createElement('span');
-    slider.className = 'slider';
-    sw.appendChild(inp);
-    sw.appendChild(slider);
-    row.appendChild(sw);
-
+    sw.append(inp, el('span', 'slider'));
+    row.append(badge, name, sw);
     list.appendChild(row);
   }
 }
 
 function renderMascotGallery() {
-  const gallery = document.getElementById('mascotGallery');
-  // Destroy old mascot canvases
-  gallery.querySelectorAll('.mascot-visual').forEach(v => {
-    const c = v.querySelector('canvas');
-    if (c) destroyMascotCanvas(c);
-  });
-  gallery.innerHTML = '';
-  const states = ['idle', 'thinking', 'waiting_permission'];
+  destroyGallery();
+  const gallery = $('mascotGallery');
   for (const a of currentAgents) {
-    const item = document.createElement('div');
-    item.className = 'mascot-item';
+    const item = el('div', 'mascot-item');
     if (!a.supported) item.style.opacity = '0.4';
-    const vis = document.createElement('div');
-    vis.className = 'mascot-visual';
-    vis.style.background = 'transparent';
-    // Show all 3 animation states side by side
-    for (const st of states) {
-      const canvas = createMascotCanvas(a.id, st, 40);
-      vis.appendChild(canvas);
-    }
-    const nm = document.createElement('div');
-    nm.className = 'mascot-name';
-    nm.textContent = a.name;
-    item.appendChild(vis);
-    item.appendChild(nm);
+    const vis = el('div', 'mascot-visual');
+    for (const st of ['idle', 'thinking', 'waiting_permission']) vis.appendChild(createMascotCanvas(a.id, st, 36));
+    item.append(vis, el('div', 'mascot-name', a.name));
     gallery.appendChild(item);
   }
 }
 
-// Settings form bindings
-document.querySelectorAll('.tab').forEach(t => {
-  t.addEventListener('click', () => {
-    document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
-    document.querySelectorAll('.tab-content').forEach(x => x.classList.remove('active'));
-    t.classList.add('active');
-    document.querySelector(`[data-panel="${t.dataset.tab}"]`).classList.add('active');
-  });
-});
+function destroyGallery() {
+  const gallery = $('mascotGallery');
+  gallery.querySelectorAll('canvas').forEach(c => destroyMascotCanvas(c));
+  gallery.textContent = '';
+}
 
-document.getElementById('selLang').addEventListener('change', (e) => {
-  window.codePeek.setConfig({ language: e.target.value });
-});
-document.getElementById('chkStartOnLogin').addEventListener('change', async (e) => {
-  await window.codePeek.toggleAutoStart(e.target.checked);
-});
-document.getElementById('selDisplay').addEventListener('change', (e) => {
-  window.codePeek.setConfig({ displayId: parseInt(e.target.value) });
-});
-document.getElementById('chkAutoHide').addEventListener('change', (e) => {
-  window.codePeek.setConfig({ autoHidePanel: e.target.checked });
-});
-document.getElementById('chkHoverExpand').addEventListener('change', (e) => {
-  window.codePeek.setConfig({ hoverExpand: e.target.checked });
-});
-document.getElementById('rangeHoverExpandDelay').addEventListener('input', (e) => {
-  document.getElementById('valHoverExpandDelay').textContent = e.target.value + 'ms';
-});
-document.getElementById('rangeHoverExpandDelay').addEventListener('change', (e) => {
-  window.codePeek.setConfig({ hoverExpandDelay: parseInt(e.target.value) || 0 });
-});
-document.getElementById('rangeHoverCollapseDelay').addEventListener('input', (e) => {
-  document.getElementById('valHoverCollapseDelay').textContent = e.target.value + 'ms';
-});
-document.getElementById('rangeHoverCollapseDelay').addEventListener('change', (e) => {
-  window.codePeek.setConfig({ hoverCollapseDelay: parseInt(e.target.value) || 0 });
-});
-document.getElementById('rangeCompletionTime').addEventListener('input', (e) => {
-  document.getElementById('valCompletionTime').textContent = e.target.value + 's';
-});
-document.getElementById('rangeCompletionTime').addEventListener('change', (e) => {
-  window.codePeek.setConfig({ completionDisplayTime: parseInt(e.target.value) || 5 });
-});
-document.getElementById('chkSuppressNotif').addEventListener('change', (e) => {
-  window.codePeek.setConfig({ suppressNotifications: e.target.checked });
-});
-document.getElementById('numCleanup').addEventListener('change', (e) => {
-  window.codePeek.setConfig({ cleanupStaleAfter: parseInt(e.target.value) || 0 });
-});
-document.getElementById('rangePanelWidth').addEventListener('input', (e) => {
-  document.getElementById('valPanelWidth').textContent = e.target.value + 'px';
-});
-document.getElementById('rangePanelWidth').addEventListener('change', (e) => {
-  window.codePeek.setConfig({ panelWidth: parseInt(e.target.value) });
-});
-document.getElementById('rangePanelHeight').addEventListener('input', (e) => {
-  document.getElementById('valPanelHeight').textContent = e.target.value + 'px';
-});
-document.getElementById('rangePanelHeight').addEventListener('change', (e) => {
-  window.codePeek.setConfig({ panelHeight: parseInt(e.target.value) });
-});
-document.getElementById('rangeFontSize').addEventListener('input', (e) => {
-  document.getElementById('valFontSize').textContent = e.target.value + 'px';
-});
-document.getElementById('rangeFontSize').addEventListener('change', (e) => {
-  window.codePeek.setConfig({ fontSize: parseInt(e.target.value) });
-});
-document.getElementById('numRespLines').addEventListener('change', (e) => {
-  window.codePeek.setConfig({ responseLines: parseInt(e.target.value) || 2 });
-});
-document.getElementById('chkMascots').addEventListener('change', (e) => {
-  window.codePeek.setConfig({ mascotEnabled: e.target.checked });
-});
-document.getElementById('rangePeekHeight').addEventListener('input', (e) => {
-  document.getElementById('valPeekHeight').textContent = e.target.value + 'px';
+const bindConfig = (id, ev, map) => $(id).addEventListener(ev, (e) => window.codePeek.setConfig(map(e.target)));
+const bindRangeLabel = (id, valId, unit) => $(id).addEventListener('input', (e) => { $(valId).textContent = e.target.value + unit; });
+
+bindConfig('selLang', 'change', x => ({ language: x.value }));
+$('chkStartOnLogin').addEventListener('change', (e) => window.codePeek.toggleAutoStart(e.target.checked));
+bindConfig('selDisplay', 'change', x => ({ displayId: parseInt(x.value) || null }));
+bindConfig('chkAutoHide', 'change', x => ({ autoHidePanel: x.checked }));
+bindConfig('chkHoverExpand', 'change', x => ({ hoverExpand: x.checked }));
+bindRangeLabel('rangeHoverExpandDelay', 'valHoverExpandDelay', 'ms');
+bindConfig('rangeHoverExpandDelay', 'change', x => ({ hoverExpandDelay: parseInt(x.value) || 0 }));
+bindRangeLabel('rangeHoverCollapseDelay', 'valHoverCollapseDelay', 'ms');
+bindConfig('rangeHoverCollapseDelay', 'change', x => ({ hoverCollapseDelay: parseInt(x.value) || 0 }));
+bindRangeLabel('rangeCompletionTime', 'valCompletionTime', 's');
+bindConfig('rangeCompletionTime', 'change', x => ({ completionDisplayTime: parseInt(x.value) || 5 }));
+bindConfig('chkSuppressNotif', 'change', x => ({ suppressNotifications: x.checked }));
+bindConfig('numCleanup', 'change', x => ({ cleanupStaleAfter: parseInt(x.value) || 0 }));
+bindRangeLabel('rangePanelWidth', 'valPanelWidth', 'px');
+bindConfig('rangePanelWidth', 'change', x => ({ panelWidth: parseInt(x.value) }));
+bindRangeLabel('rangePanelHeight', 'valPanelHeight', 'px');
+bindConfig('rangePanelHeight', 'change', x => ({ panelHeight: parseInt(x.value) }));
+bindRangeLabel('rangeFontSize', 'valFontSize', 'px');
+bindConfig('rangeFontSize', 'change', x => ({ fontSize: parseInt(x.value) }));
+bindConfig('numRespLines', 'change', x => ({ responseLines: parseInt(x.value) || 2 }));
+bindConfig('chkMascots', 'change', x => ({ mascotEnabled: x.checked }));
+$('rangePeekHeight').addEventListener('input', (e) => {
+  $('valPeekHeight').textContent = e.target.value + 'px';
   document.documentElement.style.setProperty('--peek-height', e.target.value + 'px');
 });
-document.getElementById('rangePeekHeight').addEventListener('change', (e) => {
-  window.codePeek.setConfig({ peekHeight: parseInt(e.target.value) || 0 });
+bindConfig('rangePeekHeight', 'change', x => ({ peekHeight: parseInt(x.value) || 5 }));
+bindConfig('chkFollowAccent', 'change', x => ({ followAccent: x.checked }));
+bindConfig('chkReduceMotion', 'change', x => ({ reduceMotion: x.checked }));
+bindRangeLabel('rangeAnimDuration', 'valAnimDuration', 'ms');
+bindConfig('rangeAnimDuration', 'change', x => ({ animationDuration: parseInt(x.value) || 300 }));
+$('segAnimEasing').addEventListener('click', (e) => {
+  const s = e.target.closest('span[data-v]');
+  if (!s) return;
+  document.querySelectorAll('#segAnimEasing span').forEach(x => x.classList.toggle('on', x === s));
+  window.codePeek.setConfig({ animationEasing: s.dataset.v });
 });
-document.getElementById('chkSoundEnabled').addEventListener('change', (e) => {
-  window.codePeek.setConfig({ soundEnabled: e.target.checked });
+$('segCollapsedMode').addEventListener('click', (e) => {
+  const s = e.target.closest('span[data-v]');
+  if (!s) return;
+  document.querySelectorAll('#segCollapsedMode span').forEach(x => x.classList.toggle('on', x === s));
+  window.codePeek.setConfig({ collapsedMode: s.dataset.v });
 });
-document.getElementById('selSoundPack').addEventListener('change', async (e) => {
+bindConfig('chkSoundEnabled', 'change', x => ({ soundEnabled: x.checked }));
+$('selSoundPack').addEventListener('change', async (e) => {
   await window.codePeek.setConfig({ soundPack: e.target.value });
-  // Refresh the local sound cache and play the "complete" sample as preview.
   currentSounds = await window.codePeek.getSounds();
   playSound('complete');
 });
-document.getElementById('rangeVolume').addEventListener('input', (e) => {
-  document.getElementById('valVolume').textContent = e.target.value + '%';
-});
-document.getElementById('rangeVolume').addEventListener('change', (e) => {
-  window.codePeek.setConfig({ soundVolume: parseInt(e.target.value) / 100 });
-});
-['SessionStart', 'ToolUse', 'Permission', 'Question', 'Complete'].forEach(name => {
-  const el = document.getElementById('chkSnd' + name);
-  if (el) el.addEventListener('change', (e) => {
-    window.codePeek.setConfig({ ['soundOn' + name]: e.target.checked });
-  });
-});
-document.querySelectorAll('.btn-play').forEach(b => {
-  b.addEventListener('click', () => playSound(b.dataset.sound));
-});
-document.getElementById('btnToggleHooks').addEventListener('click', async () => {
-  const installed = await window.codePeek.isHooksInstalled();
-  const result = installed
-    ? await window.codePeek.uninstallHooks()
-    : await window.codePeek.installHooks();
-  if (result.success) {
-    updateHookStatus();
-    showToast(installed ? currentDict.hooksUninstalled : currentDict.hooksInstalled, 'success');
-  } else {
-    showToast(result.error || currentDict.operationFailed, 'error');
-  }
-});
+bindRangeLabel('rangeVolume', 'valVolume', '%');
+bindConfig('rangeVolume', 'change', x => ({ soundVolume: parseInt(x.value) / 100 }));
+for (const n of ['SessionStart', 'ToolUse', 'Permission', 'Question', 'Complete']) {
+  bindConfig('chkSnd' + n, 'change', x => ({ ['soundOn' + n]: x.checked }));
+}
+document.querySelectorAll('.btn-play').forEach(b => b.addEventListener('click', () => playSound(b.dataset.sound)));
 
-document.getElementById('btnToggleCodexHooks').addEventListener('click', async () => {
-  const installed = await window.codePeek.isCodexHooksInstalled();
-  const result = installed
-    ? await window.codePeek.uninstallCodexHooks()
-    : await window.codePeek.installCodexHooks();
-  if (result.success) {
+async function toggleHook(isInstalled, install, uninstall) {
+  const installed = await isInstalled();
+  const result = installed ? await uninstall() : await install();
+  if (result && result.success) {
     updateHookStatus();
-    showToast(installed ? currentDict.hooksUninstalled : currentDict.hooksInstalled, 'success');
+    showToast(installed ? t('hooksUninstalled') : t('hooksInstalled'), 'success');
   } else {
-    showToast(result.error || currentDict.operationFailed, 'error');
+    showToast((result && result.error) || t('operationFailed'), 'error');
   }
-});
-
-document.getElementById('btnInstallAll').addEventListener('click', async () => {
+}
+$('btnToggleHooks').addEventListener('click', () => toggleHook(window.codePeek.isHooksInstalled, window.codePeek.installHooks, window.codePeek.uninstallHooks));
+$('btnToggleCodexHooks').addEventListener('click', () => toggleHook(window.codePeek.isCodexHooksInstalled, window.codePeek.installCodexHooks, window.codePeek.uninstallCodexHooks));
+$('btnInstallAll').addEventListener('click', async () => {
   const results = await window.codePeek.installAllHooks();
-  const failed = Object.entries(results).filter(([, r]) => !r.success);
+  const failed = Object.entries(results || {}).filter(([, r]) => !r.success);
   updateHookStatus();
-  if (failed.length === 0) {
-    showToast(currentDict.hooksInstalled || 'Hooks installed', 'success');
-  } else {
-    const msg = failed.map(([k, r]) => `${k}: ${r.error || 'failed'}`).join(' / ');
-    showToast(msg, 'error');
-  }
+  showToast(failed.length === 0 ? t('hooksInstalled') : failed.map(([k, r]) => `${k}: ${r.error || 'failed'}`).join(' / '),
+    failed.length === 0 ? 'success' : 'error');
 });
 
 // ========== Helpers ==========
-
-function getToolColorClass(toolName) {
-  if (!toolName) return 'default';
-  switch (toolName) {
-    case 'Bash': return 'bash';
-    case 'Edit': case 'Write': return 'edit';
-    case 'Read': return 'read';
-    case 'Grep': case 'Glob': return 'grep';
-    case 'Agent': case 'Task': return 'agent';
-    default: return 'default';
-  }
-}
-
-const TOOL_LINGER_MS = 2000;
-
-function getLingeringTool(session) {
-  const sid = session.id;
-  const current = session.currentTool;
-  const stored = _lastToolBySession.get(sid);
-
-  if (current) {
-    _lastToolBySession.set(sid, { tool: current, input: session.toolInput, timestamp: Date.now(), lingering: false });
-    return { tool: current, input: session.toolInput, lingering: false };
-  }
-  // No active tool: check linger
-  if (stored && !stored.lingering) {
-    stored.lingering = true;
-    stored.timestamp = Date.now();
-    setTimeout(() => {
-      _lastToolBySession.delete(sid);
-      render();
-    }, TOOL_LINGER_MS);
-    return { tool: stored.tool, input: stored.input, lingering: true };
-  }
-  if (stored && stored.lingering) {
-    if (Date.now() - stored.timestamp < TOOL_LINGER_MS) {
-      return { tool: stored.tool, input: stored.input, lingering: true };
-    }
-    _lastToolBySession.delete(sid);
-  }
-  return null;
-}
-
-function getStatusLabel(status) {
-  return {
-    active: currentDict.statusActive,
-    thinking: currentDict.statusThinking,
-    tool_use: currentDict.statusToolUse,
-    waiting_permission: currentDict.statusWaiting,
-    waiting_answer: currentDict.statusQuestion,
-    idle: currentDict.statusIdle,
-    subagent: currentDict.statusSubagent,
-    compacting: currentDict.statusCompacting
-  }[status] || status;
+function sanitizeColor(color) {
+  if (!color || typeof color !== 'string') return '#8E8E93';
+  if (/^#[0-9a-fA-F]{3,8}$/.test(color)) return color;
+  if (/^rgba?\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*(,\s*[\d.]+\s*)?\)$/.test(color)) return color;
+  return '#8E8E93';
 }
 
 function formatTimeAgo(ts) {
   if (!ts) return '';
-  const diff = Date.now() - ts;
-  const min = Math.floor(diff / 60000);
+  const min = Math.floor((Date.now() - ts) / 60000);
   if (min < 1) return '<1m';
   if (min < 60) return min + 'm';
   const hr = Math.floor(min / 60);
@@ -1767,31 +1827,20 @@ function formatTimeAgo(ts) {
 }
 
 function formatModel(model) {
-  if (!model) return '';
-  return model.replace(/^claude-/, '').replace(/^anthropic\//, '');
+  return (model || '').replace(/^claude-/, '').replace(/^anthropic\//, '');
 }
 
 function shortId(id) { return (id || '').substring(0, 8); }
 
-function escapeHtml(str) {
-  const d = document.createElement('div');
-  d.textContent = str;
-  return d.innerHTML;
-}
-
+let toastTimer = null;
 function showToast(message, type = 'success') {
-  let toast = document.querySelector('.toast');
-  if (!toast) { toast = document.createElement('div'); toast.className = 'toast'; document.body.appendChild(toast); }
-  toast.textContent = message;
-  toast.className = `toast ${type}`;
-  requestAnimationFrame(() => toast.classList.add('show'));
-  setTimeout(() => toast.classList.remove('show'), 2000);
+  const r = interactiveRect();
+  toastEl.style.setProperty('--toast-top', Math.round(r.bottom + 8) + 'px');
+  toastEl.textContent = message;
+  toastEl.className = `toast ${type}`;
+  requestAnimationFrame(() => toastEl.classList.add('show'));
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toastEl.classList.remove('show'), 2000);
 }
 
 init();
-
-document.querySelectorAll('.group-btn').forEach(btn => {
-  btn.addEventListener('click', () => {
-    window.codePeek.setConfig({ sessionGrouping: btn.dataset.group });
-  });
-});

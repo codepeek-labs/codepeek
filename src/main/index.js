@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow, ipcMain, screen, Tray, Menu, nativeImage, globalShortcut, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, screen, Tray, Menu, nativeImage, globalShortcut, shell, systemPreferences } = require('electron');
 const path = require('path');
 const SessionManager = require('./sessionManager');
 const HookServer = require('./hookServer');
@@ -13,19 +13,19 @@ const { getDict, resolveLang, setElectronLocale } = require('./i18n');
 const { getAllAgents, getEnabledAgents } = require('./agents');
 const { getAllSounds, listPacks } = require('./soundGenerator');
 const updateChecker = require('./updateChecker');
+const { debugLog } = require('./debugLog');
 
 let mainWindow = null;
 let tray = null;
 let sessionManager = null;
 let hookServer = null;
 let sessionScanner = null;
-let isExpanded = false;
 
 // Window size = expanded dimensions + shadow padding. Visual changes are driven by
 // CSS animations on the island element so we never call setBounds at runtime; that
 // avoids the system's window animation jitter and prevents the shadow from being
 // clipped against the window's boundaries.
-const WINDOW_PADDING = 16; // reserved space for the box-shadow
+const WINDOW_PADDING = 24; // reserved space for the box-shadow and the top shoulders
 
 function getWindowSize() {
   const w = (Number(config.get('panelWidth')) || 420) + WINDOW_PADDING * 2;
@@ -41,9 +41,7 @@ if (!app.requestSingleInstanceLock()) {
   process.exit(0);
 }
 
-app.on('second-instance', () => {
-  if (mainWindow) { mainWindow.show(); mainWindow.focus(); }
-});
+app.on('second-instance', () => revealWindow('second-instance'));
 
 // Absolute path of the renderer entry. Used as the single allow-listed URL for IPC.
 const RENDERER_INDEX_PATH = path.resolve(path.join(__dirname, '..', 'renderer', 'index.html'));
@@ -116,28 +114,27 @@ app.whenReady().then(async () => {
   });
 
   // On config change: notify the renderer and rebuild Windows-side resources that depend on config.
+  // setMultiple() emits (null, patch) and reset() emits (null, fullConfig); react only to keys that changed.
   config.on('changed', (key, value) => {
+    const keys = new Set(key ? [key] : Object.keys(value || {}));
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('config-changed', config.get());
-      // Sound pack changed: push the new data URLs to the renderer.
-      if (!key || key === 'soundPack' || (value && value.soundPack !== undefined)) {
+      if (keys.has('soundPack')) {
         mainWindow.webContents.send('sounds-changed', getAllSounds(config.get('soundPack') || 'soft'));
       }
     }
-    // Language changed: rebuild the tray menu.
-    if (!key || key === 'language' || (value && value.language !== undefined)) {
-      rebuildTrayMenu();
-    }
-    // Shortcut changed: re-register.
-    if (!key || key === 'shortcutToggle' || (value && value.shortcutToggle !== undefined)) {
-      registerShortcuts();
-    }
-    // Panel size changed: adjust the window.
-    if (!key || key === 'panelWidth' || key === 'panelHeight'
-        || (value && (value.panelWidth !== undefined || value.panelHeight !== undefined))) {
+    if (keys.has('language')) rebuildTrayMenu();
+    if (keys.has('shortcutToggle')) registerShortcuts();
+    if (keys.has('panelWidth') || keys.has('panelHeight') || keys.has('displayId') || keys.has('panelOffsetX')) {
       repositionWindow();
     }
   });
+
+  try {
+    systemPreferences.on('accent-color-changed', () => {
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('accent-changed', getAccentColor());
+    });
+  } catch {}
 
   createWindow();
   createTray();
@@ -192,6 +189,8 @@ function createWindow() {
     height: winH,
     x: bounds.x + Math.round((screenWidth - winW) / 2),
     y: bounds.y,
+    // WS_EX_TOOLWINDOW stays out of the taskbar after Explorer restarts; skipTaskbar's DeleteTab does not.
+    type: 'toolbar',
     frame: false,
     transparent: true,
     backgroundColor: '#00000000',
@@ -220,13 +219,13 @@ function createWindow() {
       ? evt.message
       : args[2];
     if (typeof message !== 'string') return;
-    if (message.startsWith('[completion]')) {
-      require('fs').appendFile(
-        require('path').join(require('os').homedir(), '.codepeek', 'debug.log'),
-        `${new Date().toISOString()} ${message}\n`, () => {}
-      );
-    }
+    const m = /^\[(completion|perm|ui)\] ([\s\S]*)$/.exec(message);
+    if (m) debugLog('renderer:' + m[1], m[2]);
   });
+
+  if (process.env.CODEPEEK_DEVTOOLS === '1') {
+    mainWindow.webContents.openDevTools({ mode: 'detach' });
+  }
 
   // Default to mouse-passthrough so clicks aren't captured by the transparent window.
   // forward:true still delivers mousemove events so we can detect hover. The renderer
@@ -254,11 +253,16 @@ function createWindow() {
     return { action: 'deny' };
   });
 
-  mainWindow.once('ready-to-show', () => mainWindow.show());
+  mainWindow.once('ready-to-show', () => revealWindow('startup'));
+  mainWindow.on('show', () => {
+    try { mainWindow.setSkipTaskbar(true); } catch {}
+  });
 
   mainWindow.on('close', (e) => {
     if (!app.isQuitting) { e.preventDefault(); mainWindow.hide(); }
   });
+
+  repositionWindow();
 }
 
 function getTargetDisplay() {
@@ -284,17 +288,14 @@ function createTray() {
   tray = new Tray(icon);
   tray.setToolTip('CodePeek');
   rebuildTrayMenu();
-  tray.on('click', () => {
-    if (mainWindow.isVisible()) mainWindow.focus();
-    else mainWindow.show();
-  });
+  tray.on('click', () => revealWindow('tray'));
 }
 
 function rebuildTrayMenu() {
   if (!tray) return;
   const dict = getDict(config.get('language'));
   const menu = Menu.buildFromTemplate([
-    { label: (dict.menuSettings === '设置' ? '显示' : 'Show'), click: () => { mainWindow.show(); mainWindow.focus(); } },
+    { label: dict.menuShow || 'Show', click: () => revealWindow('tray-menu') },
     { type: 'separator' },
     { label: dict.btnInstall, click: () => { try { hookInstaller.installHooks(); } catch {} } },
     { label: dict.btnUninstall, click: () => { try { hookInstaller.uninstallHooks(); } catch {} } },
@@ -435,6 +436,7 @@ function registerIPC() {
   secureHandle('get-agents', () => getAllAgents());
   secureHandle('get-sounds', () => getAllSounds(config.get('soundPack') || 'soft'));
   secureHandle('get-sound-packs', () => listPacks());
+  secureHandle('get-accent-color', () => getAccentColor());
   secureHandle('get-displays', () => screen.getAllDisplays().map(d => ({
     id: d.id,
     label: d.label || `Display ${d.id}`,
@@ -445,7 +447,6 @@ function registerIPC() {
   secureHandle('set-config', (_, patch) => {
     if (!patch || typeof patch !== 'object') return config.get();
     config.setMultiple(patch);
-    if (patch.displayId !== undefined) repositionWindow();
     return config.get();
   });
 
@@ -492,27 +493,35 @@ function registerIPC() {
     return { screenX: cursor.x, screenY: cursor.y, winBounds: win };
   });
 
-  secureHandle('approve-permission', (_, requestId, behavior, answers) => {
-    if (typeof requestId !== 'string') return;
-    if (!['allow', 'deny', 'always'].includes(behavior)) return;
-    // answers (optional, only for AskUserQuestion): { [questionText]: selectedLabel } or
-    // { [questionText]: [labels] } for multiSelect.
+  secureHandle('approve-permission', (_, requestId, behavior, answers, message) => {
+    if (typeof requestId !== 'string') return { ok: false, status: 'invalid' };
+    if (!['allow', 'deny', 'always'].includes(behavior)) return { ok: false, status: 'invalid' };
+    // answers (AskUserQuestion only): { [questionText]: label } or { [questionText]: [labels] }.
     let sanitizedAnswers = null;
     if (answers && typeof answers === 'object' && !Array.isArray(answers)) {
       sanitizedAnswers = {};
       for (const [k, v] of Object.entries(answers)) {
         if (typeof k !== 'string') continue;
-        if (typeof v === 'string') sanitizedAnswers[k] = v.substring(0, 4000);
-        else if (Array.isArray(v)) sanitizedAnswers[k] = v.filter(x => typeof x === 'string').slice(0, 64).map(x => x.substring(0, 4000));
+        // Over-long answers are rejected rather than cut, so Claude never receives a different answer.
+        if (typeof v === 'string') {
+          if (v.length > 4000) return { ok: false, status: 'invalid' };
+          sanitizedAnswers[k] = v;
+        } else if (Array.isArray(v)) {
+          const items = v.filter(x => typeof x === 'string');
+          if (items.length > 64 || items.some(x => x.length > 4000)) return { ok: false, status: 'invalid' };
+          sanitizedAnswers[k] = items;
+        }
       }
     }
-    sessionManager.approvePermission(requestId, behavior, sanitizedAnswers);
+    if (typeof message === 'string' && message.length > 8000) return { ok: false, status: 'invalid' };
+    const sanitizedMessage = typeof message === 'string' ? message : null;
+    return sessionManager.approvePermission(requestId, behavior, sanitizedAnswers, sanitizedMessage);
   });
 
   secureHandle('answer-question', (_, requestId, answer) => {
-    if (typeof requestId !== 'string' || typeof answer !== 'string') return;
+    if (typeof requestId !== 'string' || typeof answer !== 'string') return { ok: false, status: 'invalid' };
     if (answer.length > 10000) answer = answer.substring(0, 10000);
-    sessionManager.answerQuestion(requestId, answer);
+    return sessionManager.answerQuestion(requestId, answer);
   });
 
   secureHandle('install-hooks', () => {
@@ -548,9 +557,15 @@ function registerIPC() {
     return results;
   });
 
-  secureHandle('resize-window', (_, opts) => {
-    if (!mainWindow || !opts) return;
-    isExpanded = !!opts.expanded;
+  // Live horizontal drag: dx is relative to the persisted offset; the renderer saves the final value itself.
+  secureHandle('drag-window', (_, dx) => {
+    const n = Number(dx);
+    if (!Number.isFinite(n)) return null;
+    return repositionWindow((Number(config.get('panelOffsetX')) || 0) + Math.round(n));
+  });
+
+  secureHandle('focus-window', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.focus();
   });
 
   // Renderer toggles window-level mouse passthrough based on whether the cursor is over the island.
@@ -605,14 +620,39 @@ function registerIPC() {
   });
 }
 
-function repositionWindow() {
-  if (!mainWindow) return;
-  const display = getTargetDisplay();
-  const bounds = display.workArea;
-  const { width: screenWidth } = display.workAreaSize;
+// Returns the offset actually applied after clamping to the work area.
+function repositionWindow(offsetOverride) {
+  if (!mainWindow || mainWindow.isDestroyed()) return null;
+  const area = getTargetDisplay().workArea;
   const { width: winW, height: winH } = getWindowSize();
-  const x = bounds.x + Math.round((screenWidth - winW) / 2);
-  mainWindow.setBounds({ x, y: bounds.y, width: winW, height: winH });
+  const offset = offsetOverride !== undefined ? offsetOverride : (Number(config.get('panelOffsetX')) || 0);
+  const centerX = area.x + Math.round((area.width - winW) / 2);
+  const x = Math.min(Math.max(centerX + offset, area.x - WINDOW_PADDING), area.x + area.width - winW + WINDOW_PADDING);
+  const next = { x, y: area.y, width: winW, height: winH };
+  const cur = mainWindow.getBounds();
+  if (cur.x !== next.x || cur.y !== next.y || cur.width !== next.width || cur.height !== next.height) {
+    // A pure move avoids the resize that makes transparent windows flash.
+    if (cur.width === next.width && cur.height === next.height) mainWindow.setPosition(next.x, next.y);
+    else mainWindow.setBounds(next);
+  }
+  return x - centerX;
+}
+
+// Single entry for every "show" path: re-applies the taskbar policy and never steals focus.
+function revealWindow(source) {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (!mainWindow.isVisible()) mainWindow.showInactive();
+  try { mainWindow.setSkipTaskbar(true); } catch {}
+  debugLog('window', `reveal source=${source}`);
+}
+
+// Windows reports RRGGBBAA; the renderer only needs the opaque RGB part.
+function getAccentColor() {
+  try {
+    const hex = systemPreferences.getAccentColor();
+    if (typeof hex === 'string' && /^[0-9a-fA-F]{6}/.test(hex)) return '#' + hex.substring(0, 6);
+  } catch {}
+  return null;
 }
 
 function registerShortcuts() {
@@ -623,7 +663,7 @@ function registerShortcuts() {
       globalShortcut.register(toggle, () => {
         if (!mainWindow) return;
         if (mainWindow.isVisible()) mainWindow.hide();
-        else { mainWindow.show(); mainWindow.focus(); }
+        else revealWindow('shortcut');
       });
     }
   } catch {}

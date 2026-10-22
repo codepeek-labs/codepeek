@@ -304,6 +304,7 @@ class SessionScanner {
     let lastResponse = '';
     let customTitle = '';
     let aiTitle = '';
+    let gitBranch = '';
     try {
       const { headLines, tailLines } = this._readHeadTailLines(jsonlPath, 65536);
       // Look for cwd near the head; the first record usually carries it.
@@ -321,6 +322,7 @@ class SessionScanner {
         try {
           const entry = JSON.parse(tailLines[i]);
           if (entry.cwd && !cwd) cwd = entry.cwd;
+          if (!gitBranch && typeof entry.gitBranch === 'string') gitBranch = entry.gitBranch;
           if (entry.type === 'custom-title' && entry.customTitle) customTitle = customTitle || String(entry.customTitle).trim();
           if (entry.type === 'ai-title' && entry.aiTitle) aiTitle = aiTitle || String(entry.aiTitle).trim();
           const msg = entry.message;
@@ -356,6 +358,7 @@ class SessionScanner {
       model,
       lastPrompt,
       lastResponse,
+      gitBranch,
       source: 'history'
     };
   }
@@ -541,6 +544,7 @@ foreach ($p in $procs) {
       model: lastConversation.model || '',
       lastPrompt: lastConversation.lastPrompt || '',
       lastResponse: lastConversation.lastResponse || '',
+      gitBranch: lastConversation.gitBranch || '',
       source: 'scanner'
     };
   }
@@ -584,7 +588,7 @@ foreach ($p in $procs) {
 
   _getLastConversation(session) {
     const result = {
-      model: '', lastPrompt: '', lastResponse: '',
+      model: '', lastPrompt: '', lastResponse: '', gitBranch: '',
       customTitle: '', aiTitle: '',  // two title flavors read directly from the jsonl
       mtime: 0
     };
@@ -609,6 +613,7 @@ foreach ($p in $procs) {
       for (let i = tailLines.length - 1; i >= 0; i--) {
         try {
           const entry = JSON.parse(tailLines[i]);
+          if (!result.gitBranch && typeof entry.gitBranch === 'string') result.gitBranch = entry.gitBranch;
           const msg = entry.message;
           if (!msg) continue;
           if (msg.role === 'assistant' && !result.lastResponse) {
@@ -650,6 +655,7 @@ foreach ($p in $procs) {
           model: result.model,
           lastPrompt: result.lastPrompt,
           lastResponse: result.lastResponse,
+          gitBranch: result.gitBranch,
           customTitle: result.customTitle,
           aiTitle: result.aiTitle
         }

@@ -262,6 +262,75 @@ function agentStatusToMascotState(status) {
   }
 }
 
+// One shared clock drives every mascot canvas, so hidden or off-screen canvases cost nothing.
+const MascotClock = (() => {
+  const TICK_MS = 100;
+  const live = new Set();
+  let timer = null;
+  let paused = false;
+  let reduced = false;
+  const io = typeof IntersectionObserver === 'function'
+    ? new IntersectionObserver(entries => {
+        for (const e of entries) e.target._mVisible = e.isIntersecting;
+      })
+    : null;
+
+  function draw(c, now) {
+    c._mCtx.clearRect(0, 0, c._mSize, c._mSize);
+    // 0.1s is a resting frame in every state (the alert jump starts later), so static mascots stay whole.
+    const t = reduced ? 0.1 : now / 1000 - c._mStart;
+    if (c._mDraw) c._mDraw(c._mCtx, c._mSize, c._mState, t);
+    else drawFallback(c._mCtx, c._mSize, c._mState, t, c._mColor);
+    c._mLast = now;
+  }
+
+  function tick() {
+    if (paused || reduced) return;
+    const now = performance.now();
+    if (live.size === 0) { sync(); return; }
+    for (const c of live) {
+      // Canvases detached for a couple of ticks were dropped without destroy(); release them.
+      if (!c.isConnected) {
+        if ((c._mDetached = (c._mDetached || 0) + 1) > 2) { live.delete(c); if (io) io.unobserve(c); }
+        continue;
+      }
+      c._mDetached = 0;
+      if (c._mVisible === false) continue;
+      const every = c._mState === 'idle' ? 200 : TICK_MS;
+      if (now - c._mLast >= every - 5) draw(c, now);
+    }
+  }
+
+  function sync() {
+    const want = live.size > 0 && !paused && !reduced;
+    if (want && !timer) timer = setInterval(tick, TICK_MS);
+    if (!want && timer) { clearInterval(timer); timer = null; }
+  }
+
+  return {
+    add(c) {
+      live.add(c);
+      if (io) io.observe(c);
+      draw(c, performance.now());
+      sync();
+    },
+    remove(c) {
+      live.delete(c);
+      if (io) io.unobserve(c);
+      sync();
+    },
+    pause() { paused = true; sync(); },
+    resume() { paused = false; sync(); },
+    setReduced(v) {
+      reduced = !!v;
+      const now = performance.now();
+      for (const c of live) draw(c, now);
+      sync();
+    },
+    get size() { return live.size; }
+  };
+})();
+
 function createMascotCanvas(source, status, size) {
   size = size || 32;
   const canvas = document.createElement('canvas');
@@ -275,32 +344,17 @@ function createMascotCanvas(source, status, size) {
   ctx.scale(dpr, dpr);
   ctx.imageSmoothingEnabled = false;
 
-  const drawFn = DRAW_FNS[source];
-  const mascotState = agentStatusToMascotState(status);
-  const color = AGENT_COLORS[source];
-  let _timerId = null, _rafId = null, _destroyed = false;
-  const startTime = performance.now() / 1000;
-
-  function frame() {
-    if (_destroyed) return;
-    const t = performance.now() / 1000 - startTime;
-    ctx.clearRect(0, 0, size, size);
-    if (drawFn) drawFn(ctx, size, mascotState, t);
-    else drawFallback(ctx, size, mascotState, t, color);
-    const interval = mascotState === 'idle' ? 60 : 30;
-    _timerId = setTimeout(() => { _rafId = requestAnimationFrame(frame); }, interval);
-  }
-
-  _rafId = requestAnimationFrame(frame);
-  canvas._mascotDestroy = () => {
-    _destroyed = true;
-    if (_timerId) clearTimeout(_timerId);
-    if (_rafId) cancelAnimationFrame(_rafId);
-    _timerId = null; _rafId = null;
-  };
+  canvas._mCtx = ctx;
+  canvas._mSize = size;
+  canvas._mDraw = DRAW_FNS[source];
+  canvas._mColor = AGENT_COLORS[source];
+  canvas._mState = agentStatusToMascotState(status);
+  canvas._mStart = performance.now() / 1000;
+  canvas._mLast = 0;
+  MascotClock.add(canvas);
   return canvas;
 }
 
 function destroyMascotCanvas(canvas) {
-  if (canvas && canvas._mascotDestroy) canvas._mascotDestroy();
+  if (canvas && canvas._mCtx) MascotClock.remove(canvas);
 }

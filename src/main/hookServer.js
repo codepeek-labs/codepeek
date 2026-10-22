@@ -92,15 +92,6 @@ class HookServer {
       return;
     }
 
-    // Pending-count gate
-    const totalPending =
-      this.sessionManager.pendingPermissions.size + this.sessionManager.pendingQuestions.size;
-    if (totalPending >= MAX_PENDING) {
-      res.writeHead(503, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Too many pending requests' }));
-      return;
-    }
-
     const chunks = [];
     let bodyBytes = 0;
     let aborted = false;
@@ -138,29 +129,34 @@ class HookServer {
       const isBlocking = eventName === 'PermissionRequest' || eventName === 'Notification';
 
       if (isBlocking) {
+        // Only new blocking requests count toward the cap; Post/Stop/SessionEnd must still get in to release them.
+        const totalPending =
+          this.sessionManager.pendingPermissions.size + this.sessionManager.pendingQuestions.size;
+        if (totalPending >= MAX_PENDING) {
+          res.writeHead(503, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Too many pending requests' }));
+          return;
+        }
+
         let settled = false;
+        // Returns false when the answer could not be written (already answered or socket gone).
         const respond = (response) => {
-          if (settled) return;
+          if (settled) return false;
           settled = true;
           try {
-            if (!res.writableEnded) {
+            if (!res.writableEnded && !res.destroyed) {
               res.writeHead(200, { 'Content-Type': 'application/json' });
               res.end(response || '{}');
+              return true;
             }
           } catch {}
+          return false;
         };
-
-        this.sessionManager.handleEvent(event, respond);
 
         req.setTimeout(86400000);
         res.setTimeout(86400000);
 
-        // Bridge disconnected: clean up any pending so the UI isn't stuck waiting.
-        // IMPORTANT: do NOT listen on req.on('close') — Node.js fires it on the request stream's
-        // normal end-of-body lifecycle, not only on socket disconnect, so it would cancel every
-        // PermissionRequest milliseconds after it arrived (before the user could click).
-        // req.on('aborted') catches abrupt client aborts; res.on('close') catches the socket
-        // closing while we still have an unsent response — those are the real disconnect signals.
+        // Not req 'close': it fires at normal end-of-body and would cancel every request. Use 'aborted'/res 'close'.
         const onDisconnect = () => {
           if (!settled) {
             settled = true;
@@ -169,6 +165,8 @@ class HookServer {
         };
         req.on('aborted', onDisconnect);
         res.on('close', () => { if (!res.writableEnded) onDisconnect(); });
+
+        this.sessionManager.handleEvent(event, respond);
       } else {
         this.sessionManager.handleEvent(event, null);
         try {

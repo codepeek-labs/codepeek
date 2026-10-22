@@ -26,14 +26,19 @@ const DEFAULT_CONFIG = {
   cleanupStaleAfter: 300,      // seconds; 0 = never clean up
 
   // Appearance
-  panelWidth: 420,
+  panelWidth: 600,
   panelHeight: 560,
   fontSize: 13,
   responseLines: 2,
   mascotEnabled: true,
   peekHeight: 6,             // pixels of the top strip exposed when collapsed
-  sessionGrouping: 'all',    // all | status | cli
+  sessionGrouping: 'status', // status | cli | all
   panelOffsetX: 0,           // horizontal drag offset in px
+  collapsedMode: 'smart',    // smart (strip, pill while a request waits) | pill | strip
+  followAccent: true,        // use the Windows accent color for neutral selection/controls
+  reduceMotion: false,       // true forces reduced motion even if Windows animations are on
+  animationDuration: 300,    // ms for expanding; collapsing takes two thirds of it
+  animationEasing: 'snappy', // snappy (fast start, long settle) | smooth (gentle start)
 
   // Sound
   soundEnabled: true,
@@ -54,6 +59,8 @@ const DEFAULT_CONFIG = {
   shortcutToggle: 'Control+Shift+I',
   shortcutApprove: 'Control+Y',
   shortcutDeny: 'Control+N',
+
+  configVersion: 2,
 
   // Agents (supported tools enabled/disabled)
   agents: {
@@ -83,10 +90,21 @@ class Config extends EventEmitter {
       }
       if (fs.existsSync(CONFIG_PATH)) {
         const loaded = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+        const migrated = this._migrate(loaded);
         // Merge with defaults so newly added fields are always present.
         this._data = this._deepMerge(DEFAULT_CONFIG, loaded);
+        if (migrated) this._save();
       }
     } catch {}
+  }
+
+  // v1 files stored every default verbatim, so the old defaults are treated as "never customized".
+  _migrate(loaded) {
+    if (!loaded || typeof loaded !== 'object' || (loaded.configVersion || 1) >= 2) return false;
+    if (loaded.panelWidth === 420) loaded.panelWidth = 600;
+    if (loaded.sessionGrouping === 'all') loaded.sessionGrouping = 'status';
+    loaded.configVersion = 2;
+    return true;
   }
 
   _save() {
