@@ -10,6 +10,7 @@ const STORE_PATH = path.join(os.homedir(), '.codepeek', 'attention.json');
 const KEEP_MS = 7 * 24 * 3600 * 1000;
 const MAX_TEXT = 20000;
 const SAVE_DEBOUNCE_MS = 500;
+const MAX_RECORDS = 300;
 
 class AttentionStore {
   constructor(opts = {}) {
@@ -39,9 +40,21 @@ class AttentionStore {
     if (this._saveTimer.unref) this._saveTimer.unref();
   }
 
+  // Expired records go, and the oldest read ones once the store grows large; alert-next flags are always kept.
+  _prune() {
+    const now = Date.now();
+    for (const [id, r] of this._records) if (!r.alertNext && now - (r.since || 0) > KEEP_MS) this._records.delete(id);
+    if (this._records.size <= MAX_RECORDS) return;
+    const idle = Array.from(this._records.values())
+      .filter(r => !r.alertNext && (!r.kind || (r.kind === 'reply' && r.seenVersion >= r.version)))
+      .sort((a, b) => (a.since || 0) - (b.since || 0));
+    for (const r of idle.slice(0, this._records.size - MAX_RECORDS)) this._records.delete(r.sessionId);
+  }
+
   // Atomic write so a crash mid-save never leaves a truncated file.
   flush() {
     if (!this._path) return;
+    this._prune();
     try {
       fs.mkdirSync(path.dirname(this._path), { recursive: true });
       const tmp = this._path + '.tmp';
@@ -65,15 +78,36 @@ class AttentionStore {
   // A finished turn becomes a new reply; `seen` marks it read at once (the user was already looking).
   reply(sessionId, meta, text, { seen = false } = {}) {
     const r = this._record(sessionId, meta);
+    // A background agent still waiting on the user is parked, and returns once this reply has been read.
+    if ((r.kind === 'input' || r.kind === 'blocked') && r.actor && r.actor !== 'main') {
+      r.stash = { ...(r.stash || {}), [r.actor]: { kind: r.kind, reason: r.reason, text: r.text, since: r.since } };
+    }
     r.kind = 'reply';
     r.version += 1;
     r.since = Date.now();
     r.text = typeof text === 'string' ? text.substring(0, MAX_TEXT) : '';
     r.reason = '';
-    delete r.stash;
-    if (seen) r.seenVersion = r.version;
+    r.actor = 'main';
+    if (seen) this._afterSeen(r);
     this._scheduleSave();
     return r;
+  }
+
+  _afterSeen(r) {
+    r.seenVersion = r.version;
+    this._restoreParked(r);
+  }
+
+  // Brings back the most recent parked flag, if any, as the record's current state.
+  _restoreParked(r) {
+    const rest = Object.keys(r.stash || {});
+    if (!rest.length) return false;
+    const who = rest[rest.length - 1];
+    const prev = r.stash[who];
+    delete r.stash[who];
+    Object.assign(r, { kind: prev.kind, reason: prev.reason, text: prev.text, since: prev.since, actor: who });
+    r.version += 1;
+    return true;
   }
 
   // Needs-input and blocked records stay until the session moves on, regardless of "seen".
@@ -119,13 +153,7 @@ class AttentionStore {
     }
     if (r.kind !== kind) return false;
     if (actor !== undefined && r.actor && r.actor !== actor) return false;
-    const rest = Object.keys(r.stash || {});
-    if (!rest.length) return this.clear(sessionId);
-    const who = rest[rest.length - 1];
-    const prev = r.stash[who];
-    delete r.stash[who];
-    Object.assign(r, { kind: prev.kind, reason: prev.reason, text: prev.text, since: prev.since, actor: who });
-    r.version += 1;
+    if (!this._restoreParked(r)) return this.clear(sessionId);
     this._scheduleSave();
     return true;
   }
@@ -144,6 +172,7 @@ class AttentionStore {
     const v = Number.isFinite(version) ? Math.min(version, r.version) : r.version;
     if (v <= r.seenVersion) return false;
     r.seenVersion = v;
+    if (v === r.version) this._restoreParked(r);
     this._scheduleSave();
     return true;
   }

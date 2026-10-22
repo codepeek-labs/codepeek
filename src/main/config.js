@@ -110,7 +110,12 @@ class Config extends EventEmitter {
         fs.mkdirSync(CONFIG_DIR, { recursive: true });
       }
       if (fs.existsSync(CONFIG_PATH)) {
-        const loaded = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+        let loaded;
+        try { loaded = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')); } catch (e) {
+          // Keep the unreadable file for recovery instead of silently overwriting it with defaults.
+          try { fs.copyFileSync(CONFIG_PATH, CONFIG_PATH + '.corrupt'); } catch {}
+          throw e;
+        }
         const migrated = this._migrate(loaded);
         // Merge with defaults so newly added fields are always present.
         this._data = this._deepMerge(DEFAULT_CONFIG, loaded);
@@ -139,7 +144,10 @@ class Config extends EventEmitter {
       if (!fs.existsSync(CONFIG_DIR)) {
         fs.mkdirSync(CONFIG_DIR, { recursive: true });
       }
-      fs.writeFileSync(CONFIG_PATH, JSON.stringify(this._data, null, 2), 'utf8');
+      // Atomic replace: a crash mid-write must never leave a truncated file that resets every setting.
+      const tmp = CONFIG_PATH + '.tmp';
+      fs.writeFileSync(tmp, JSON.stringify(this._data, null, 2), 'utf8');
+      fs.renameSync(tmp, CONFIG_PATH);
     } catch {}
   }
 

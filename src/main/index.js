@@ -116,7 +116,7 @@ app.whenReady().then(async () => {
   let lastSuppress = null;
   policy.on('change', (st) => {
     sendToRenderer('focus-state', st);
-    // Quiet periods silence every sound, so their start and end are logged for "why no sound" questions.
+    // Quiet periods change what pops up (and DND / fullscreen silence sounds), so their edges are logged.
     if (st.suppress !== lastSuppress) {
       lastSuppress = st.suppress;
       debugLog('focus', `quiet=${st.suppress} away=${st.away}${st.awayReason ? '(' + st.awayReason + ')' : ''} dnd=${st.dnd} fullscreen=${st.fullscreen}`);
@@ -162,11 +162,10 @@ app.whenReady().then(async () => {
     // An explicit "alert me next time" outranks the project mute.
     if (!alertNext && isMutedProject(payload.cwd)) return;
     // Every finished turn chimes (soundOnComplete); whether a card also pops up is the alert mode's call.
-    sessionManager.emit('sound', 'complete', { sessionId: payload.sessionId });
+    sessionManager.emit('sound', 'complete', { sessionId: payload.sessionId, force: alertNext });
     if (!policy.shouldExpandCompletion({ turnMs: payload.turnMs, looking, alertNext })) return;
     // Consumed only once it is actually shown; a suppressed one stays armed for the next finish.
     if (alertNext) sessionManager.attention.consumeAlertNext(payload.sessionId);
-    // A card that is allowed to pop up also chimes (soundOnComplete still applies); quiet mode never gets here.
     sendToRenderer('completion-notify', { ...payload, kind: 'completion', alertNext, sound: false });
   });
 
@@ -193,7 +192,7 @@ app.whenReady().then(async () => {
     };
     const s = meta && meta.sessionId ? sessionManager.sessions.get(meta.sessionId) : null;
     const skip = !config.get('soundEnabled') ? 'sound-off' : (policy && policy.isSilent()) ? 'dnd-or-fullscreen'
-      : !config.get(keyMap[type]) ? 'type-off' : (s && isMutedProject(s.cwd)) ? 'muted-project' : '';
+      : !config.get(keyMap[type]) ? 'type-off' : (s && isMutedProject(s.cwd) && !(meta && meta.force)) ? 'muted-project' : '';
     // toolUse fires on every tool call; only the sounds a user listens for are logged.
     if (type !== 'toolUse') debugLog('sound', `${type} ${skip ? 'skipped ' + skip : 'played'}`);
     if (skip) return;
@@ -383,16 +382,20 @@ function trayIcon(kind) {
 // The dot shows the most urgent thing: waiting on you > new replies > running > idle.
 let trayTimer = null;
 let trayKind = '';
+// Debounced; the latest state wins, so a request answered inside the window never leaves the tray stale.
+let trayState = null;
 function scheduleTrayUpdate(state) {
+  trayState = state;
   if (trayTimer) return;
   trayTimer = setTimeout(() => {
     trayTimer = null;
     if (!tray) return;
+    const state = trayState;
     const dict = getDict(config.get('language'));
     const att = state.attention || [];
     const waiting = state.pendingPermissions.length + state.pendingQuestions.length + att.filter(a => a.kind !== 'reply').length;
     const replies = att.filter(a => a.kind === 'reply').length;
-    const running = state.sessions.filter(s => s.isRunning !== false && ['thinking', 'tool_use', 'subagent', 'compacting'].includes(s.status)).length;
+    const running = state.sessions.filter(s => s.isRunning !== false && ['thinking', 'tool_use', 'subagent', 'compacting', 'background'].includes(s.status)).length;
     const kind = waiting ? 'waiting' : replies ? 'reply' : running ? 'running' : 'idle';
     if (kind !== trayKind) { trayKind = kind; tray.setImage(trayIcon(kind)); }
     const parts = [];
@@ -735,6 +738,7 @@ function registerIPC() {
     }
     const reconnect = ['remoteEnabled', 'remoteClientId', 'remoteRobotCode', 'remoteSecretEnc'].some(k => k in next);
     config.setMultiple(next);
+    if (next.remoteStaffId === '') remote.unbind();
     debugLog('remote', `settings saved keys=${Object.keys(next).filter(k => k !== 'remoteSecretEnc').join(',')}${next.remoteSecretEnc ? ',secret' : ''}`);
     if (reconnect) remote.reload(); else remote.evaluate();
     return { ok: true, status: remote.status() };
@@ -886,10 +890,12 @@ function isMutedProject(cwd) {
 function sendQuietSummary(since) {
   const st = sessionManager.getState();
   const att = (st.attention || []).filter(a => !isMutedProject(a.cwd));
+  const cwdOf = (sid) => (st.sessions.find(s => s.id === sid) || {}).cwd;
+  const pending = [...st.pendingPermissions, ...st.pendingQuestions].filter(p => !isMutedProject(cwdOf(p.sessionId)));
   const summary = {
     kind: 'summary',
     since,
-    questions: st.pendingPermissions.length + st.pendingQuestions.length,
+    questions: pending.length,
     replies: att.filter(a => a.kind === 'reply' && a.since >= since).length,
     inputs: att.filter(a => a.kind === 'input').length,
     blocked: att.filter(a => a.kind === 'blocked').length,

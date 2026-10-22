@@ -106,11 +106,13 @@
         continue;
       }
       if (!line.trim()) {
-        const nxt = lines.slice(i + 1).find(l => l.trim());
+        // Skip the whole blank run at once; re-scanning ahead from every blank line was quadratic.
+        let j = i + 1;
+        while (j < lines.length && !lines[j].trim()) j++;
+        const nxt = lines[j];
         if (nxt === undefined || indentOf(nxt) <= base && !ITEM.test(nxt)) break;
         blank = true;
-        item.lines.push('');
-        i++;
+        for (; i < j; i++) item.lines.push('');
         continue;
       }
       if (indentOf(line) > base) { item.lines.push(stripIndent(line, Math.min(item.offset, indentOf(line)))); i++; continue; }

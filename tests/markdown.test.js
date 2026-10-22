@@ -79,3 +79,9 @@ test('links keep balanced parentheses in the URL', () => {
   assert.equal(n[0].href, 'https://en.wikipedia.org/wiki/Foo_(bar)');
   assert.equal(n[1].v, ' after');
 });
+
+test('long blank runs inside a list stay linear', () => {
+  const t0 = Date.now();
+  md.parse('- x\n' + '\n'.repeat(50000) + '- y');
+  assert.ok(Date.now() - t0 < 200, `took ${Date.now() - t0}ms`);
+});

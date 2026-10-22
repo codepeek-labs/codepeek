@@ -113,7 +113,9 @@ class AttentionPolicy extends EventEmitter {
   // For UserPromptSubmit: null when we cannot tell (helper not running), else whether the user is at that session.
   presenceAt(sessionId, watcherAlive) {
     if (!watcherAlive) return null;
-    return !!(!this.away && this.foreground && this.foreground.sessionId === sessionId);
+    // Only a confirmed match counts: a browser tab that merely shares the session's title is not the terminal.
+    return !!(!this.away && !this._ownForeground && this.foreground && this.foreground.confidence === 'confirmed'
+      && this.foreground.sessionId === sessionId);
   }
 
   shouldExpandCompletion({ turnMs, looking, alertNext }) {
@@ -131,6 +133,7 @@ class AttentionPolicy extends EventEmitter {
   setForeground(fg, sessions, procMap, ownPids) {
     const wasQuiet = this._quietNow();
     const own = !!(fg && ownPids && ownPids.has(fg.pid));
+    const backFromIsland = this._ownForeground && !own;
     this._ownForeground = own;
     const match = own ? this.foreground : matchForegroundSession(fg, sessions, procMap);
     // Clicking the island itself must not count as leaving fullscreen or the watched terminal.
@@ -141,13 +144,9 @@ class AttentionPolicy extends EventEmitter {
     const same = prev && match && prev.sessionId === match.sessionId && prev.confidence === match.confidence;
     if (!same) {
       this.foreground = match ? { ...match, since: Date.now() } : null;
-      clearTimeout(this._seenTimer);
-      if (match && match.confidence === 'confirmed') {
-        const id = match.sessionId;
-        this._seenTimer = setTimeout(() => {
-          if (this.isLookingAt(id)) this.emit('seen', id);
-        }, SEEN_DWELL_MS);
-      }
+      this._armSeen();
+    } else if (backFromIsland) {
+      this._armSeen();
     }
     const quietChanged = wasQuiet !== this._quietNow();
     if (quietChanged) this._quietEdge(wasQuiet);
@@ -156,6 +155,17 @@ class AttentionPolicy extends EventEmitter {
 
   idleSeconds() {
     try { return Number(this._getIdle()) || 0; } catch { return 0; }
+  }
+
+  // Replies count as read only after the user has kept the session's own terminal in front for a moment.
+  _armSeen() {
+    clearTimeout(this._seenTimer);
+    const fg = this.foreground;
+    if (!fg || fg.confidence !== 'confirmed') return;
+    const id = fg.sessionId;
+    this._seenTimer = setTimeout(() => {
+      if (this.isLookingAt(id)) this.emit('seen', id);
+    }, SEEN_DWELL_MS);
   }
 
   pollIdle() {
@@ -170,7 +180,8 @@ class AttentionPolicy extends EventEmitter {
     const wasQuiet = this._quietNow();
     this.away = on;
     this.awayReason = on ? reason : '';
-    if (on) clearTimeout(this._seenTimer);
+    // Coming back to the terminal that was left in front counts as looking at it again.
+    if (on) clearTimeout(this._seenTimer); else this._armSeen();
     this._quietEdge(wasQuiet);
     this._changed('away');
   }

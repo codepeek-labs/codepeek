@@ -54,9 +54,10 @@ function getAncestorChain(pid) {
 // Minimal PowerShell script: only does window focusing + tab switching.
 // No CIM queries, no process validation — all done in Node.js already.
 function buildFocusScript(ancestorPids, sessionName, cwd) {
-  const safeName = (sessionName || '').replace(/['`\$]/g, '').substring(0, 100);
+  // PowerShell also treats the typographic quotes \u2018-\u201B as single quotes.
+  const safeName = (sessionName || '').replace(/['`$\u2018-\u201B]/g, '').substring(0, 100);
   const cands = buildCandidateNames(sessionName, cwd)
-    .map(c => "'" + c.replace(/['`\$]/g, '').substring(0, 200) + "'");
+    .map(c => "'" + c.replace(/['`$\u2018-\u201B]/g, '').substring(0, 200) + "'");
   const candList = cands.length ? cands.join(',') : "''";
   const pidArray = ancestorPids.join(',');
   return `

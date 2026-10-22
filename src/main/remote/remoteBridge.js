@@ -37,8 +37,20 @@ const OUTCOME_LABEL = { allowed: '已允许', denied: '已拒绝', clarify: '已
 const BLOCKED_LABEL = { rate_limit: '触发限流', billing_error: '额度或账单问题' };
 const EDIT_TOOLS = new Set(['Edit', 'MultiEdit', 'Write', 'NotebookEdit']);
 
+const SECRET_KEY = /(pass(word|wd)?|pwd|secret|token|auth(orization)?|api[_-]?key|access[_-]?key|private[_-]?key|credential|cookie|session[_-]?id)/i;
+
+// Structured inputs are masked by key before serialising, so whole values go (spaces and all), not just a prefix.
+function redactObject(v, depth = 0) {
+  if (depth > 8 || v === null || typeof v !== 'object') return v;
+  if (Array.isArray(v)) return v.map(x => redactObject(x, depth + 1));
+  const out = {};
+  for (const [k, val] of Object.entries(v)) out[k] = SECRET_KEY.test(k) && val !== null && typeof val !== 'object' ? '***' : redactObject(val, depth + 1);
+  return out;
+}
+
 // Common credential shapes are masked before anything leaves the machine.
 const SECRET_PATTERNS = [
+  [/((['"])(?:[\w-]*?)(?:pass(?:word|wd)?|pwd|secret|token|authorization|api[_-]?key|access[_-]?key)[\w-]*\2\s*:\s*)(["'])(?:(?!\3)[^\\]|\\.)*\3/gi, '$1$3***$3'],
   [/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(-----END [A-Z ]*PRIVATE KEY-----|$)/g, '[私钥已隐藏]'],
   [/\b(authorization\s*[:=]\s*(?:bearer|basic|token)?\s*)[^\s'"]+/gi, '$1***'],
   [/(['"]?\b(?:api[_-]?key|access[_-]?key|secret|token|passwd|password|pwd)\w*['"]?\s*[:=]\s*['"]?)[^\s'"&,}]+/gi, '$1***'],
@@ -77,7 +89,7 @@ function sourceFields(toolName, raw, display) {
     case 'Task': case 'Agent': return { command: str(raw.prompt), description: str(raw.description) };
     default: {
       let json = '';
-      try { json = JSON.stringify(raw, null, 2); } catch {}
+      try { json = JSON.stringify(redactObject(raw), null, 2); } catch {}
       return { command: json };
     }
   }
@@ -572,3 +584,4 @@ module.exports = RemoteBridge;
 module.exports.parseAnswers = parseAnswers;
 module.exports.normalize = normalize;
 module.exports.redact = redact;
+module.exports.redactObject = redactObject;

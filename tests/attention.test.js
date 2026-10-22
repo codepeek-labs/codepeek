@@ -376,3 +376,48 @@ test('sounds: new requests emit their sound; only DND and fullscreen silence, be
   assert.equal(p.isSilent(), true, 'a fullscreen window that only shares a title is not the terminal');
   p.stop();
 });
+
+test('presence needs a confirmed terminal; returning from away re-arms the read timer', async () => {
+  const p = new AttentionPolicy({ config: memConfig({ dndUntil: 0 }) });
+  const procMap = new Map([[300, { parentPid: 200, createdAt: 3 }], [200, { parentPid: 100, createdAt: 2 }], [100, { parentPid: 1, createdAt: 1 }]]);
+  const sessions = [{ id: 'a', name: 'DEMO新功能', pid: 300 }];
+  p.setForeground({ title: 'DEMO新功能', pid: 555, fullscreen: false }, sessions, procMap, new Set());
+  assert.equal(p.presenceAt('a', true), false, 'a same-titled window elsewhere is not presence');
+  const seen = [];
+  p.on('seen', (id) => seen.push(id));
+  p.setForeground({ title: '✳ DEMO新功能', pid: 100, fullscreen: false }, sessions, procMap, new Set());
+  assert.equal(p.presenceAt('a', true), true);
+  p.setAway(true, 'idle');
+  await new Promise(r => setTimeout(r, 1700));
+  assert.deepEqual(seen, [], 'nothing is read while away');
+  p.setAway(false);
+  await new Promise(r => setTimeout(r, 1700));
+  assert.deepEqual(seen, ['a']);
+  p.stop();
+});
+
+test('a background agent still waiting comes back once the main reply is read', () => {
+  const st = new AttentionStore({ path: null });
+  st.flag('s1', null, 'input', 'agent_needs_input', 'which db?', 'bg-1');
+  const r = st.reply('s1', null, 'main turn done');
+  assert.equal(st.list()[0].kind, 'reply');
+  st.markSeen('s1', r.version);
+  assert.equal(st.list()[0].kind, 'input', 'the parked flag is back');
+  assert.equal(st.list()[0].text, 'which db?');
+  st.clearFlag('s1', 'input', 'bg-1');
+  assert.equal(st.list().length, 0);
+});
+
+test('the inbox is pruned while running: expired and the oldest read records go', () => {
+  const file = path.join(TMP_HOME, 'attention-prune.json');
+  const st = new AttentionStore({ path: file });
+  for (let i = 0; i < 400; i++) { const r = st.reply('s' + i, null, 'x'.repeat(100)); st.markSeen('s' + i, r.version); }
+  st.reply('unread', null, 'keep me');
+  st.setAlertNext('armed', true);
+  st._records.get('armed').since = Date.now() - 30 * 24 * 3600 * 1000;
+  st.flush();
+  const saved = JSON.parse(require('fs').readFileSync(file, 'utf8')).records;
+  assert.ok(saved.length <= 300, `kept ${saved.length}`);
+  assert.ok(saved.some(r => r.sessionId === 'unread'));
+  assert.ok(saved.some(r => r.sessionId === 'armed'), 'alert-next survives expiry');
+});

@@ -441,3 +441,12 @@ test('a message without a text type is ignored', async () => {
   await bridge.handle({ staffId: 'u1', single: true, text: 'ls', nick: 'n' });
   assert.equal(ch.replies.length, 0);
 });
+
+test('masking covers quoted JSON keys, values with spaces, and nested structured inputs', () => {
+  const { redact, redactObject } = RemoteBridge;
+  const s = redact('{"Authorization": "Bearer abc def", "password": "a b c", "user": "me"}');
+  assert.ok(!/abc def|a b c/.test(s), s);
+  assert.match(s, /"user": "me"/);
+  const o = redactObject({ db: { password: 'p w', host: 'h' }, headers: [{ 'X-Api-Key': 'k1' }], sql: 'select 1' });
+  assert.deepEqual(o, { db: { password: '***', host: 'h' }, headers: [{ 'X-Api-Key': '***' }], sql: 'select 1' });
+});

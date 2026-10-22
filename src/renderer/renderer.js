@@ -264,6 +264,12 @@ function flushDeferredCompletion() {
   if (!deferredCompletions.size || ui.settingsOpen || hasUnsnoozedPending() || focusState.suppress || completion) return;
   const [id, d] = deferredCompletions.entries().next().value;
   deferredCompletions.delete(id);
+  // Only still-unread replies of that exact version are worth showing late.
+  const rec = attentionOf(id);
+  if (d.kind === 'completion' && (!rec || rec.kind !== 'reply' || (d.version && rec.version !== d.version))) {
+    if (deferredCompletions.size) setTimeout(flushDeferredCompletion, 0);
+    return;
+  }
   showCompletion(d);
 }
 
@@ -921,7 +927,11 @@ function sessionCard(s, view, rec) {
   r.more.style.display = expandable ? '' : 'none';
   r.more.textContent = open ? t('showLess') : t('showReply');
   r.detail.style.display = open ? '' : 'none';
-  if (open) Markdown.render(r.detail, replyText);
+  // Re-render only when the text changed; tool updates re-run this card many times per turn.
+  if (open && r.detail._md !== replyText) { Markdown.render(r.detail, replyText); r.detail._md = replyText; }
+  // A newer reply arriving under an open detail starts its own read timer.
+  const ver = rec && rec.kind === 'reply' ? rec.version : 0;
+  if (open && ver && r.detail._ver !== ver) { r.detail._ver = ver; armDetailTimer(s.id); }
   setText(r.err, s.lastError ? '⚠ ' + String(s.lastError).substring(0, 160) : '');
   r.tool.textContent = '';
   r.tool.style.display = toolInfo ? '' : 'none';
@@ -1464,6 +1474,7 @@ function handleCompletion(data) {
 }
 
 function showCompletion(data) {
+  if (data.sessionId) deferredCompletions.delete(data.sessionId);
   if (completion && completion.timer) clearTimeout(completion.timer);
   completion = { data, timer: null, hover: false };
   lastCompletionShownAt = Date.now();
@@ -1568,7 +1579,8 @@ function checkFollowUps(now) {
     const n = f.n;
     uiLog(`follow-up id=${r.id} n=${n + 1}`);
     snoozed.delete(r.id);
-    playSound(r.id.startsWith('q_') ? 'question' : 'permission');
+    const s = currentState.sessions.find(x => x.id === r.sessionId);
+    if (!isMutedCwd(s && s.cwd)) playSound(r.id.startsWith('q_') ? 'question' : 'permission');
     reconcile();
     const card = requestCards.get(r.id);
     if (card) { card.classList.remove('nudge'); void card.offsetWidth; card.classList.add('nudge'); }
@@ -2274,7 +2286,11 @@ function renderRemote(st) {
   $('txtRemoteSecret').placeholder = st.hasSecret ? t('remoteSecretSaved') : 'ClientSecret (AppSecret)';
   const stateEl = $('remoteState');
   const label = { off: t('remoteStateOff'), connecting: t('remoteStateConnecting'), connected: t('remoteStateConnected'), error: t('remoteStateError') }[st.state] || st.state;
-  stateEl.textContent = st.state === 'error' && st.error ? `${label} · ${st.error}` : (!st.secureStorage ? t('remoteNoSecureStorage') : st.paused && st.state === 'connected' ? `${label} · ${t('remotePaused')}` : label);
+  const needsCreds = st.enabled && (!st.clientId || !st.hasSecret);
+  stateEl.textContent = st.state === 'error' && st.error ? `${label} · ${st.error}`
+    : !st.secureStorage ? t('remoteNoSecureStorage')
+    : needsCreds ? t('remoteNeedsCreds')
+    : st.paused && st.state === 'connected' ? `${label} · ${t('remotePaused')}` : label;
   stateEl.className = 'hstate ' + (st.state === 'connected' ? 'ok' : st.state === 'error' || !st.secureStorage ? 'bad' : st.state === 'connecting' ? 'warn' : '');
   const bound = $('remoteBound');
   clearInterval(remoteTick);

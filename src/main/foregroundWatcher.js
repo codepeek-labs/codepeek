@@ -83,16 +83,22 @@ class ForegroundWatcher extends EventEmitter {
     child.stdout.on('data', (d) => this._onData(d));
     child.on('exit', () => {
       this._child = null;
+      this._buf = '';
+      // A stale sample would keep a closed terminal "in front" (marking replies read) or a game "fullscreen" (silencing).
+      if (this.current) { this.current = null; this.emit('change', null); }
       if (this._stopped || this._restarts > 5) return;
       // Back off so a helper that keeps dying (e.g. blocked PowerShell) does not spin.
       const delay = Math.min(60000, 2000 * Math.pow(2, this._restarts++));
-      setTimeout(() => this.start(), delay).unref();
+      this._retry = setTimeout(() => { this._retry = null; if (!this._stopped) this.start(); }, delay);
+      this._retry.unref();
     });
     child.on('error', () => {});
   }
 
   stop() {
     this._stopped = true;
+    clearTimeout(this._retry);
+    this._retry = null;
     if (this._child) { try { this._child.kill(); } catch {} }
     this._child = null;
   }
