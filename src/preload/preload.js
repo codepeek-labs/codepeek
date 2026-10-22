@@ -25,6 +25,11 @@ contextBridge.exposeInMainWorld('codePeek', {
   getFocusState: () => ipcRenderer.invoke('get-focus-state'),
   getHealth: () => ipcRenderer.invoke('get-health'),
   repairHooks: () => ipcRenderer.invoke('repair-hooks'),
+  remoteGet: () => ipcRenderer.invoke('remote-get'),
+  remoteSave: (patch) => ipcRenderer.invoke('remote-save', patch),
+  remotePair: () => ipcRenderer.invoke('remote-pair'),
+  remoteUnbind: () => ipcRenderer.invoke('remote-unbind'),
+  remoteTest: () => ipcRenderer.invoke('remote-test'),
 
   // Hooks - Claude
   installHooks: () => ipcRenderer.invoke('install-hooks'),
@@ -89,6 +94,11 @@ contextBridge.exposeInMainWorld('codePeek', {
     const h = (_, action) => cb(action);
     ipcRenderer.on('shortcut', h);
     return () => ipcRenderer.removeListener('shortcut', h);
+  },
+  onRemoteStatus: (cb) => {
+    const h = (_, st) => cb(st);
+    ipcRenderer.on('remote-status', h);
+    return () => ipcRenderer.removeListener('remote-status', h);
   },
   onFocusState: (cb) => {
     const h = (_, st) => cb(st);

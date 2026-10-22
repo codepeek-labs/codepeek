@@ -234,7 +234,7 @@ class SessionManager extends EventEmitter {
   }
 
   // Returns { ok, status } where status is accepted | already-settled | invalid | delivery-failed.
-  approvePermission(requestId, behavior, answers, message) {
+  approvePermission(requestId, behavior, answers, message, source = 'island') {
     const pending = this.pendingPermissions.get(requestId);
     if (!pending) return { ok: false, status: 'already-settled' };
     let decision;
@@ -260,18 +260,18 @@ class SessionManager extends EventEmitter {
       return { ok: false, status: 'invalid' };
     }
     const response = JSON.stringify({ hookSpecificOutput: { hookEventName: 'PermissionRequest', decision } });
-    const status = this._settlePending(requestId, { response, outcome, reason: 'island' });
+    const status = this._settlePending(requestId, { response, outcome, reason: source });
     return { ok: status === 'accepted', status };
   }
 
-  answerQuestion(requestId, answer) {
+  answerQuestion(requestId, answer, source = 'island') {
     const pending = this.pendingQuestions.get(requestId);
     if (!pending) return { ok: false, status: 'already-settled' };
     const response = JSON.stringify({ hookSpecificOutput: { hookEventName: 'Notification', answer } });
     this.pendingQuestions.delete(requestId);
     let delivered = false;
     try { delivered = pending.respond(response) !== false; } catch {}
-    this._pushResolved(requestId, pending.sessionId, 'answered', 'island');
+    this._pushResolved(requestId, pending.sessionId, 'answered', source);
     this._refreshWaitingStatus(pending.sessionId);
     this.emit('state-changed');
     return { ok: delivered, status: delivered ? 'accepted' : 'delivery-failed' };
@@ -438,7 +438,8 @@ class SessionManager extends EventEmitter {
     }
     debugLog('perm', `settled id=${id} outcome=${outcome} reason=${reason} delivered=${delivered} binding=${p.binding.state}`);
     if (silent) return delivered ? 'accepted' : 'delivery-failed';
-    this._pushResolved(id, p.sessionId, outcome, reason);
+    // A decision that never reached the CLI did not happen; the request simply ended.
+    this._pushResolved(id, p.sessionId, delivered ? outcome : 'ended', reason);
     this._refreshWaitingStatus(p.sessionId);
     this.emit('state-changed');
     return delivered ? 'accepted' : 'delivery-failed';
@@ -447,6 +448,7 @@ class SessionManager extends EventEmitter {
   _pushResolved(id, sessionId, outcome, reason) {
     this._recentlyResolved.push({ id, sessionId, outcome, reason, at: Date.now() });
     if (this._recentlyResolved.length > 50) this._recentlyResolved.shift();
+    this.emit('resolved', { id, sessionId, outcome, reason });
   }
 
   _refreshWaitingStatus(sessionId, fallback = 'thinking') {
@@ -666,6 +668,7 @@ class SessionManager extends EventEmitter {
     }
 
     debugLog('perm', `received id=${requestId} sid=${sessionId} tool=${toolName} actor=${actor === 'main' ? 'main' : 'sub'} binding=${binding.state} req=${event.bridge_request_id || '-'}`);
+    this.emit('sound', 'permission', { sessionId });
     this._refreshWaitingStatus(sessionId);
     this.emit('state-changed');
   }
@@ -687,6 +690,7 @@ class SessionManager extends EventEmitter {
       sessionId, question, timestamp: Date.now(),
       respond: respond || (() => false)
     });
+    this.emit('sound', 'question', { sessionId });
     this._refreshWaitingStatus(sessionId);
     this.emit('state-changed');
   }
@@ -724,13 +728,10 @@ class SessionManager extends EventEmitter {
       session.lastResponse = text;
       session.lastResponseAt = Date.now();
     }
-    // background_tasks distinguishes "paused waiting for background work" from "done".
+    // Background work keeps the session marked as running, but the turn still ended with a reply worth an alert.
     const background = Array.isArray(event.background_tasks) ? event.background_tasks.length : 0;
-    if (background > 0) {
-      this._updateSessionStatus(sessionId, 'background', String(background));
-      return;
-    }
-    this._updateSessionStatus(sessionId, 'idle');
+    debugLog('stop', `sid=${sessionId} background=${background} text=${hasText ? text.length : '-'}`);
+    this._updateSessionStatus(sessionId, background > 0 ? 'background' : 'idle', background > 0 ? String(background) : undefined);
     this._emitCompletion(sessionId, text);
   }
 

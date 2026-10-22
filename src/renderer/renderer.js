@@ -31,7 +31,6 @@ const permissionsList = $('permissionsList');
 const questionsList = $('questionsList');
 const completionBody = $('completionBody');
 const toastEl = $('toast');
-const audio = $('audio');
 const SECTIONS = {
   list: $('sessionsSection'),
   approval: $('permissionsSection'),
@@ -76,13 +75,15 @@ const ui = {
 
 // Request ids the user collapsed away: they stop auto-expanding but stay reachable from the pill.
 const snoozed = new Set();
-const seenRequests = new Set();
 // id -> local outcome while our own IPC submit is in flight.
 const submitting = new Map();
 // id -> { el, surface, timer } while a resolved card plays its exit.
 const exiting = new Map();
 // Request cards are cached by id so AskUserQuestion drafts survive re-renders.
 const requestCards = new Map();
+const followUps = new Map(); // request id -> nudges already given
+let followHoldUntil = 0;
+let followWasQuiet = false;
 const sessionCards = new Map();
 const groupHeaders = new Map();
 const lastToolBySession = new Map();
@@ -136,8 +137,6 @@ async function init() {
   ]);
   try { focusState = await window.codePeek.getFocusState() || focusState; } catch {}
   currentState = normalizeState(currentState);
-  for (const p of currentState.pendingPermissions) seenRequests.add(p.id);
-  for (const q of currentState.pendingQuestions) seenRequests.add(q.id);
 
   applyConfigToUI();
   applyI18n();
@@ -159,6 +158,7 @@ async function init() {
   window.codePeek.onCollapse(() => userCollapse('main'));
   window.codePeek.onCompletionNotify(data => handleCompletion(data));
   window.codePeek.onAccentChanged(color => { accentColor = color; applyAccent(); });
+  window.codePeek.onRemoteStatus(st => { if (ui.settingsOpen) renderRemote(st); });
   window.codePeek.onFocusState(st => { focusState = st || focusState; renderHeader(); reconcile(); });
   window.codePeek.onShortcut(action => handleShortcut(action));
 
@@ -204,13 +204,8 @@ function handleState(state) {
   for (const id of prevIds) {
     if (!liveIds.has(id)) startExit(id);
   }
-  for (const id of liveIds) {
-    if (!seenRequests.has(id)) {
-      seenRequests.add(id);
-      if (!focusState.suppress) playSound(id.startsWith('q_') ? 'question' : 'permission');
-    }
-  }
   for (const id of Array.from(snoozed)) if (!liveIds.has(id)) snoozed.delete(id);
+  for (const id of Array.from(followUps.keys())) if (!liveIds.has(id)) followUps.delete(id);
   for (const id of Array.from(requestCards.keys())) {
     if (!liveIds.has(id) && !exiting.has(id)) requestCards.delete(id);
   }
@@ -218,6 +213,11 @@ function handleState(state) {
 }
 
 function livePerms() { return currentState.pendingPermissions; }
+const normCwd = (p) => String(p || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+function isMutedCwd(cwd) {
+  const k = normCwd(cwd);
+  return !!k && (currentConfig.mutedProjects || []).includes(k);
+}
 function attentionOf(sessionId) { return currentState.attention.find(a => a.sessionId === sessionId) || null; }
 function inboxCounts() {
   const att = currentState.attention;
@@ -849,6 +849,8 @@ function sessionCard(s, view, rec) {
       window.codePeek.setAlertNext(s.id, on);
       showToast(on ? t('alertNextOn') : t('alertNextOff'), 'success');
     });
+    const muted = el('span', 'mute-badge');
+    muted.appendChild(icon('E74F'));
     const read = el('button', 'cbtn read');
     read.appendChild(icon('E73E'));
     read.addEventListener('click', (e) => {
@@ -858,7 +860,7 @@ function sessionCard(s, view, rec) {
     });
     const time = el('span', 'tchip');
     const term = el('span', 'term');
-    meta.append(read, bell, time, term);
+    meta.append(muted, read, bell, time, term);
     row1.append(chip, name, branch, meta);
     const prompt = el('div', 'line prompt');
     const reply = el('div', 'line reply');
@@ -871,7 +873,7 @@ function sessionCard(s, view, rec) {
     main.append(row1, prompt, reply, more, detail, tool, err);
     root.append(av, main);
     root.addEventListener('click', (e) => handleSessionClick(s.id, e));
-    c = { el: root, refs: { av, chip, name, branch, read, bell, time, term, prompt, reply, more, detail, tool, err }, fp: '' };
+    c = { el: root, refs: { av, chip, name, branch, muted, read, bell, time, term, prompt, reply, more, detail, tool, err }, fp: '' };
     sessionCards.set(s.id, c);
   }
   const toolInfo = toolLineFor(s, view);
@@ -882,7 +884,7 @@ function sessionCard(s, view, rec) {
   const open = openDetails.has(s.id);
   const fp = [view.cls, view.label, sessionName(s), s.gitBranch, s.lastPrompt, replyText, s.lastError, s.pid, s.isRunning,
     toolInfo ? `${toolInfo.cls}|${toolInfo.name}|${toolInfo.arg}|${toolInfo.linger}` : '', s.id === selectedSessionId,
-    currentConfig.mascotEnabled, rec ? `${rec.kind}:${rec.version}` : '', since, alertNext, open].join('\u0001');
+    currentConfig.mascotEnabled, rec ? `${rec.kind}:${rec.version}` : '', since, alertNext, open, isMutedCwd(s.cwd)].join('\u0001');
   const r = c.refs;
   setTimeChip(r.time, s, since);
   setMascot(r.av, s.agent || 'claude', view.mascot, 36);
@@ -900,6 +902,8 @@ function sessionCard(s, view, rec) {
   r.bell.title = alertNext ? t('alertNextOff') : t('alertNextOn');
   r.bell.style.display = s.isRunning === false ? 'none' : '';
   r.read.style.display = rec && rec.kind === 'reply' ? '' : 'none';
+  r.muted.style.display = isMutedCwd(s.cwd) ? '' : 'none';
+  r.muted.title = t('mutedBadge');
   r.read.title = t('markRead');
   r.term.textContent = '';
   if (s.isRunning === false) {
@@ -911,13 +915,13 @@ function sessionCard(s, view, rec) {
     r.term.appendChild(document.createTextNode((a && a.name) || (s.agent || 'claude')));
   }
   setText(r.prompt, s.lastPrompt);
-  setText(r.reply, open ? '' : replyText);
+  setText(r.reply, open ? '' : Markdown.plainText(replyText));
   // The full reply is on demand; opening it for a moment counts as having read this version.
   const expandable = !!replyText && (view.key === 'reply' || replyText.length > 90 || replyText.includes('\n'));
   r.more.style.display = expandable ? '' : 'none';
   r.more.textContent = open ? t('showLess') : t('showReply');
   r.detail.style.display = open ? '' : 'none';
-  if (open) r.detail.textContent = replyText;
+  if (open) Markdown.render(r.detail, replyText);
   setText(r.err, s.lastError ? '⚠ ' + String(s.lastError).substring(0, 160) : '');
   r.tool.textContent = '';
   r.tool.style.display = toolInfo ? '' : 'none';
@@ -1464,7 +1468,7 @@ function showCompletion(data) {
   completion = { data, timer: null, hover: false };
   lastCompletionShownAt = Date.now();
   const kind = data.kind || 'completion';
-  if (data.sound && !focusState.suppress) playSound(kind === 'completion' ? 'complete' : kind === 'summary' ? 'question' : 'permission');
+  if (data.sound && !focusState.silent) playSound(kind === 'completion' ? 'complete' : kind === 'summary' ? 'question' : 'permission');
   console.log(`[completion] show kind=${kind} expanded=${ui.expanded}`);
   completionBody.textContent = '';
   reconcile();
@@ -1524,7 +1528,7 @@ function renderCompletion() {
     if (d.gitBranch) t1.appendChild(el('span', 'branch', `⑂ ${d.gitBranch}`));
   }
   body.appendChild(t1);
-  const summary = kind === 'summary' ? t('summaryHint') : (d.lastResponse || d.sessionTitle || d.cwd || '').toString().trim();
+  const summary = kind === 'summary' ? t('summaryHint') : (Markdown.plainText(d.lastResponse || '') || d.sessionTitle || d.cwd || '').toString().trim();
   if (summary) body.appendChild(el('div', 't2', summary));
   const view = el('span', 'term');
   view.appendChild(icon(kind === 'summary' ? 'E8FD' : 'E8A7'));
@@ -1549,8 +1553,32 @@ function renderCompletion() {
 }
 
 // ========== Clocks ==========
+// An unanswered request is nudged again after N minutes and once more after 3N; the end of a quiet period
+// already brings a summary, so nudges wait another minute after it.
+function checkFollowUps(now) {
+  if (focusState.silent) { followWasQuiet = true; return; }
+  if (followWasQuiet) { followWasQuiet = false; followHoldUntil = now + 60000; }
+  const mins = Number(currentConfig.followUpMinutes) || 0;
+  if (mins <= 0 || now < followHoldUntil) return;
+  const gap = mins * 60000;
+  for (const r of liveRequests()) {
+    const f = followUps.get(r.id) || { n: 0, at: 0 };
+    if (f.n >= 2 || now - (r.timestamp || now) < gap * (f.n === 0 ? 1 : 3) || now - f.at < gap) continue;
+    followUps.set(r.id, { n: f.n + 1, at: now });
+    const n = f.n;
+    uiLog(`follow-up id=${r.id} n=${n + 1}`);
+    snoozed.delete(r.id);
+    playSound(r.id.startsWith('q_') ? 'question' : 'permission');
+    reconcile();
+    const card = requestCards.get(r.id);
+    if (card) { card.classList.remove('nudge'); void card.offsetWidth; card.classList.add('nudge'); }
+    return;
+  }
+}
+
 function tickClocks() {
   const now = Date.now();
+  checkFollowUps(now);
   const nodes = [];
   if (indicator.classList.contains('mode-pill') && pillTime.dataset.since) nodes.push(pillTime);
   if (ui.expanded) island.querySelectorAll('.panel [data-since]').forEach(n => nodes.push(n));
@@ -1631,15 +1659,22 @@ function handleShortcut(action) {
   if (ui.expanded) userCollapse('shortcut'); else expand('click');
 }
 
+const lastPlayed = {};
 function playSound(type) {
   if (!currentConfig.soundEnabled) return;
+  // Several sessions finishing together give one chime, not a stutter.
+  const now = Date.now();
+  if (now - (lastPlayed[type] || 0) < 1200) return;
   const keyMap = { sessionStart: 'soundOnSessionStart', toolUse: 'soundOnToolUse', permission: 'soundOnPermission', question: 'soundOnQuestion', complete: 'soundOnComplete' };
   if (keyMap[type] && !currentConfig[keyMap[type]]) return;
   const url = currentSounds[type];
-  if (!url) return;
-  audio.src = url;
-  audio.volume = currentConfig.soundVolume || 0.5;
-  audio.play().catch(() => {});
+  if (!url) { console.log(`[sound] ${type} has no audio in the current pack`); return; }
+  lastPlayed[type] = now;
+  // A fresh element per sound so a second sound never cuts the first one off.
+  const a = new Audio(url);
+  a.volume = currentConfig.soundVolume || 0.5;
+  // A rejected play() (e.g. an autoplay block) is otherwise silent, which makes "no sound" impossible to diagnose.
+  a.play().catch((e) => console.log(`[sound] ${type} play failed: ${(e && e.name) || e}`));
 }
 
 // ========== Config / i18n / theme ==========
@@ -1864,15 +1899,47 @@ function onKeyDown(e) {
   }
 }
 
+// Session-specific actions first (right-click on a card), then the app-wide ones.
+function sessionMenuItems(sessionId) {
+  const s = inboxSessions().find(x => x.id === sessionId);
+  if (!s) return [];
+  const items = [];
+  const rec = attentionOf(sessionId);
+  if (rec && rec.kind === 'reply') items.push([t('markRead'), () => window.codePeek.markSeen(sessionId, rec.version)]);
+  if (s.isRunning !== false) {
+    const on = currentState.alertNext.includes(sessionId);
+    items.push([on ? t('alertNextOff') : t('alertNextOn'), () => window.codePeek.setAlertNext(sessionId, !on)]);
+  }
+  if (s.cwd) {
+    const k = normCwd(s.cwd);
+    const muted = isMutedCwd(s.cwd);
+    items.push([muted ? t('menuUnmuteProject') : t('menuMuteProject'), () => {
+      const list = (currentConfig.mutedProjects || []).filter(x => x !== k);
+      if (!muted) list.push(k);
+      window.codePeek.setConfig({ mutedProjects: list });
+      showToast(muted ? t('toastUnmuted') : t('toastMuted'), 'success');
+    }]);
+  }
+  return items;
+}
+
 island.addEventListener('contextmenu', (e) => {
   e.preventDefault();
   document.querySelectorAll('.context-menu').forEach(m => m.remove());
   const menu = el('div', 'context-menu');
+  const cardEl = e.target.closest('.card[data-session-id]');
+  const extra = cardEl ? sessionMenuItems(cardEl.dataset.sessionId) : [];
+  for (const [label, run] of extra) {
+    const it = el('div', 'context-item', label);
+    it.onclick = () => { menu.remove(); run(); };
+    menu.appendChild(it);
+  }
+  if (extra.length) menu.appendChild(el('div', 'context-divider'));
   const settings = el('div', 'context-item', t('menuSettings'));
   const quit = el('div', 'context-item danger', t('menuQuit'));
   menu.append(settings, el('div', 'context-divider'), quit);
   menu.style.left = Math.min(e.clientX, window.innerWidth - 180) + 'px';
-  menu.style.top = Math.min(e.clientY, window.innerHeight - 100) + 'px';
+  menu.style.top = Math.min(e.clientY, window.innerHeight - 40 - 34 * (extra.length + 2)) + 'px';
   document.body.appendChild(menu);
   settings.onclick = () => { menu.remove(); openSettings(); };
   quit.onclick = () => { menu.remove(); window.codePeek.quitApp(); };
@@ -1933,9 +2000,13 @@ function populateSettings() {
   document.querySelectorAll('#segCompletionAlert span').forEach(x => x.classList.toggle('on', x.dataset.v === alertMode));
   setRange('rangeShortTurn', 'valShortTurn', currentConfig.shortTurnSeconds || 20, 's');
   setRange('rangeAwayIdle', 'valAwayIdle', Math.round((currentConfig.awayIdleSeconds || 120) / 60), 'min');
+  $('rangeFollowUp').value = Number(currentConfig.followUpMinutes) || 0;
+  $('valFollowUp').textContent = followUpLabel(currentConfig.followUpMinutes);
+  renderMutedList();
   $('valShortcutToggle').textContent = prettyAccel(currentConfig.shortcutToggle);
   $('valShortcutNext').textContent = prettyAccel(currentConfig.shortcutNext);
   refreshHealth();
+  refreshRemote();
   $('numCleanup').value = currentConfig.cleanupStaleAfter;
 
   setRange('rangePanelWidth', 'valPanelWidth', currentConfig.panelWidth, 'px');
@@ -2062,6 +2133,31 @@ bindRangeLabel('rangeShortTurn', 'valShortTurn', 's');
 bindConfig('rangeShortTurn', 'change', x => ({ shortTurnSeconds: parseInt(x.value) || 20 }));
 bindRangeLabel('rangeAwayIdle', 'valAwayIdle', 'min');
 bindConfig('rangeAwayIdle', 'change', x => ({ awayIdleSeconds: (parseInt(x.value) || 2) * 60 }));
+$('rangeFollowUp').addEventListener('input', (e) => { $('valFollowUp').textContent = followUpLabel(e.target.value); });
+bindConfig('rangeFollowUp', 'change', x => ({ followUpMinutes: Math.max(0, parseInt(x.value) || 0) }));
+
+function followUpLabel(v) {
+  const n = Number(v) || 0;
+  return n > 0 ? n + 'min' : t('followUpOff');
+}
+
+function renderMutedList() {
+  const box = $('mutedList');
+  box.textContent = '';
+  const list = currentConfig.mutedProjects || [];
+  if (!list.length) { box.appendChild(el('span', 'muted-none', t('mutedNone'))); return; }
+  for (const k of list) {
+    const row = el('span', 'muted-item');
+    row.appendChild(el('span', 'p', k.split('/').filter(Boolean).pop() || k));
+    row.title = k;
+    const x = el('button', 'x');
+    x.appendChild(icon('E711'));
+    x.title = t('menuUnmuteProject');
+    x.onclick = () => window.codePeek.setConfig({ mutedProjects: list.filter(v => v !== k) });
+    row.appendChild(x);
+    box.appendChild(row);
+  }
+}
 $('btnHealthCheck').addEventListener('click', () => refreshHealth(true));
 $('btnHealthRepair').addEventListener('click', async () => {
   const r = await window.codePeek.repairHooks();
@@ -2159,6 +2255,91 @@ function shortId(id) { return (id || '').substring(0, 8); }
 function prettyAccel(a) {
   return String(a || '').replace(/Control/g, 'Ctrl').replace(/\+/g, ' + ') || '—';
 }
+
+// ---------- Remote answering (DingTalk) ----------
+let remoteStatus = null;
+let remoteTick = null;
+
+async function refreshRemote() {
+  try { renderRemote(await window.codePeek.remoteGet()); } catch {}
+}
+
+function renderRemote(st) {
+  if (!st) return;
+  remoteStatus = st;
+  const active = document.activeElement;
+  $('chkRemote').checked = !!st.enabled;
+  if (active !== $('txtRemoteClientId')) $('txtRemoteClientId').value = st.clientId || '';
+  if (active !== $('txtRemoteRobot')) $('txtRemoteRobot').value = st.robotCode || '';
+  $('txtRemoteSecret').placeholder = st.hasSecret ? t('remoteSecretSaved') : 'ClientSecret (AppSecret)';
+  const stateEl = $('remoteState');
+  const label = { off: t('remoteStateOff'), connecting: t('remoteStateConnecting'), connected: t('remoteStateConnected'), error: t('remoteStateError') }[st.state] || st.state;
+  stateEl.textContent = st.state === 'error' && st.error ? `${label} · ${st.error}` : (!st.secureStorage ? t('remoteNoSecureStorage') : st.paused && st.state === 'connected' ? `${label} · ${t('remotePaused')}` : label);
+  stateEl.className = 'hstate ' + (st.state === 'connected' ? 'ok' : st.state === 'error' || !st.secureStorage ? 'bad' : st.state === 'connecting' ? 'warn' : '');
+  const bound = $('remoteBound');
+  clearInterval(remoteTick);
+  if (st.pairing) {
+    bound.textContent = '';
+    bound.appendChild(el('span', 'pair-code', st.pairing.code));
+    const left = () => Math.max(0, Math.ceil((st.pairing.expiresAt - Date.now()) / 1000));
+    $('remoteBindHint').textContent = fmt('remotePairHint', { s: left() });
+    remoteTick = setInterval(() => {
+      if (left() <= 0) { clearInterval(remoteTick); refreshRemote(); return; }
+      $('remoteBindHint').textContent = fmt('remotePairHint', { s: left() });
+    }, 1000);
+  } else {
+    bound.textContent = st.bound ? (st.nick || t('remoteBoundYes')) : t('remoteBoundNo');
+    bound.className = 'hstate ' + (st.bound ? 'ok' : '');
+    $('remoteBindHint').textContent = st.bound ? t('remoteBoundHint') : t('remoteUnboundHint');
+  }
+  const connected = st.state === 'connected';
+  $('btnRemotePair').style.display = connected && !st.pairing ? '' : 'none';
+  $('btnRemotePair').textContent = st.bound ? t('remoteRepair') : t('remotePair');
+  $('btnRemoteTest').style.display = connected && st.bound ? '' : 'none';
+  $('btnRemoteUnbind').style.display = st.bound ? '' : 'none';
+  document.querySelectorAll('#segRemotePush span').forEach(x => x.classList.toggle('on', x.dataset.v === st.pushWhen));
+  $('rowRemoteAway').style.display = st.pushWhen === 'away' ? '' : 'none';
+  $('rowRemoteDelay').style.display = st.pushWhen === 'always' ? '' : 'none';
+  $('remotePushHint').textContent = st.pushWhen === 'away' ? t('remotePushAwayHint') : t('remotePushAlwaysHint');
+  if (active !== $('rangeRemoteAway')) $('rangeRemoteAway').value = Math.round(st.awaySeconds / 60);
+  $('valRemoteAway').textContent = Math.round(st.awaySeconds / 60) + 'min';
+  if (active !== $('rangeRemoteDelay')) $('rangeRemoteDelay').value = st.delaySeconds;
+  $('valRemoteDelay').textContent = st.delaySeconds + 's';
+}
+
+async function saveRemote(patch, announce) {
+  let r;
+  try { r = await window.codePeek.remoteSave(patch); } catch { r = null; }
+  if (!r || !r.ok) {
+    showToast(r && r.error === 'secure-storage' ? t('remoteNoSecureStorage') : `${t('remoteSaveFailed')}${r && r.error ? ': ' + r.error : ''}`, 'error');
+    return false;
+  }
+  renderRemote(r.status);
+  if (announce) showToast(t('remoteSaved'), 'success');
+  return true;
+}
+
+$('chkRemote').addEventListener('change', (e) => saveRemote({ enabled: e.target.checked }));
+$('btnRemoteSave').addEventListener('click', async () => {
+  const patch = { clientId: $('txtRemoteClientId').value.trim(), robotCode: $('txtRemoteRobot').value.trim() };
+  const secret = $('txtRemoteSecret').value.trim();
+  if (secret) patch.clientSecret = secret;
+  if (await saveRemote(patch, true)) $('txtRemoteSecret').value = '';
+});
+$('btnRemotePair').addEventListener('click', async () => { await window.codePeek.remotePair(); refreshRemote(); });
+$('btnRemoteUnbind').addEventListener('click', async () => { renderRemote(await window.codePeek.remoteUnbind()); });
+$('btnRemoteTest').addEventListener('click', async () => {
+  const r = await window.codePeek.remoteTest();
+  showToast(r && r.ok ? t('remoteTestSent') : `${t('remoteTestFailed')}: ${(r && r.error) || ''}`, r && r.ok ? 'success' : 'error');
+});
+$('segRemotePush').addEventListener('click', (e) => {
+  const s = e.target.closest('span[data-v]');
+  if (s) saveRemote({ pushWhen: s.dataset.v });
+});
+$('rangeRemoteAway').addEventListener('input', (e) => { $('valRemoteAway').textContent = e.target.value + 'min'; });
+$('rangeRemoteAway').addEventListener('change', (e) => saveRemote({ awaySeconds: (parseInt(e.target.value) || 2) * 60 }));
+$('rangeRemoteDelay').addEventListener('input', (e) => { $('valRemoteDelay').textContent = e.target.value + 's'; });
+$('rangeRemoteDelay').addEventListener('change', (e) => saveRemote({ delaySeconds: parseInt(e.target.value) || 0 }));
 
 async function refreshHealth(announce) {
   let h;

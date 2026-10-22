@@ -96,16 +96,17 @@ function mk(presence = true) {
 }
 const ev = (sm, name, extra = {}) => sm.handleEvent({ hook_event_name: name, session_id: 's1', _source: 'claude', ...extra }, null);
 
-test('Stop records its own final message and a background pause is not a completion', () => {
+test('Stop records its own final message; a turn ending with background work still alerts', () => {
   const sm = mk();
   const done = [];
   sm.on('completion', (c) => done.push(c));
   ev(sm, 'UserPromptSubmit', { prompt: 'do it' });
   ev(sm, 'Stop', { last_assistant_message: '全部完成', background_tasks: [{ id: 'x' }] });
-  assert.equal(done.length, 0);
+  assert.equal(done.length, 1, 'the reply is a finished turn even while background work runs');
   assert.equal(sm.sessions.get('s1').status, 'background');
   ev(sm, 'Stop', { last_assistant_message: '全部完成' });
-  assert.equal(done.length, 1);
+  assert.equal(done.length, 1, 'a second Stop within a second is merged');
+  assert.equal(sm.sessions.get('s1').status, 'idle');
   assert.equal(done[0].lastResponse, '全部完成');
   assert.ok(done[0].turnMs >= 0);
   const att = sm.getState().attention;
@@ -330,4 +331,48 @@ test('an explicit empty final message is not replaced by an older transcript tai
   sm.scannedSessions = [{ id: 's1', lastResponse: 'older text' }];
   assert.equal(sm.getState().sessions.find(s => s.id === 's1').lastResponse, '');
   sm.destroy();
+});
+
+test('a fullscreen terminal is not a quiet period; a fullscreen game is', () => {
+  const p = new AttentionPolicy({ config: memConfig({ dndUntil: 0 }) });
+  p.setForeground({ title: 'x', pid: 7, fullscreen: true, className: 'CASCADIA_HOSTING_WINDOW_CLASS' }, [], new Map(), new Set());
+  assert.equal(p.isQuiet(), false);
+  p.setForeground({ title: 'game', pid: 8, fullscreen: true, className: 'UnityWndClass' }, [], new Map(), new Set());
+  assert.equal(p.isQuiet(), true);
+  p.stop();
+});
+
+test('config v4 restores the prompt chime that v3 forced off, and leaves other choices alone', () => {
+  const config = require('../src/main/config');
+  const a = { configVersion: 3, soundOnSessionStart: false, soundOnComplete: false };
+  assert.equal(config._migrate(a), true);
+  assert.equal(a.soundOnSessionStart, true);
+  assert.equal(a.soundOnComplete, false);
+  assert.equal(a.configVersion, 4);
+  const b = { configVersion: 2, soundOnSessionStart: false };
+  config._migrate(b);
+  assert.equal(b.soundOnSessionStart, false, 'a v2 user who turned it off keeps it off');
+});
+
+test('sounds: new requests emit their sound; only DND and fullscreen silence, being away does not', () => {
+  const sm = mk();
+  const sounds = [];
+  sm.on('sound', (type) => sounds.push(type));
+  sm.handleEvent({ hook_event_name: 'PermissionRequest', session_id: 's1', _source: 'claude', tool_name: 'Bash', tool_input: { command: 'ls' } }, respondSpy());
+  sm.handleEvent({ hook_event_name: 'Notification', session_id: 'c1', _source: 'codex', message: 'which one?' }, respondSpy());
+  assert.deepEqual(sounds, ['permission', 'question']);
+  sm.destroy();
+
+  const p = new AttentionPolicy({ config: memConfig({ dndUntil: 0 }) });
+  p.setAway(true, 'idle');
+  assert.equal(p.isQuiet(), true);
+  assert.equal(p.isSilent(), false, 'away holds back pop-ups, not sounds');
+  p.setAway(false);
+  p.setDnd(30);
+  assert.equal(p.isSilent(), true);
+  p.setDnd(0);
+  const sessions = [{ id: 'a', name: 'Budget', pid: 300 }];
+  p.setForeground({ title: 'Budget', pid: 999, fullscreen: true, className: 'Chrome_WidgetWin_1' }, sessions, new Map(), new Set());
+  assert.equal(p.isSilent(), true, 'a fullscreen window that only shares a title is not the terminal');
+  p.stop();
 });

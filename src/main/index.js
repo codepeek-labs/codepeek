@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow, ipcMain, screen, Tray, Menu, nativeImage, globalShortcut, shell, systemPreferences, powerMonitor } = require('electron');
+const { app, BrowserWindow, ipcMain, screen, Tray, Menu, nativeImage, globalShortcut, shell, systemPreferences, powerMonitor, safeStorage } = require('electron');
 const path = require('path');
 const SessionManager = require('./sessionManager');
 const HookServer = require('./hookServer');
@@ -16,6 +16,8 @@ const updateChecker = require('./updateChecker');
 const { debugLog } = require('./debugLog');
 const AttentionPolicy = require('./attentionPolicy');
 const ForegroundWatcher = require('./foregroundWatcher');
+const RemoteBridge = require('./remote/remoteBridge');
+const { DingTalkStream } = require('./remote/dingtalk');
 
 let mainWindow = null;
 let tray = null;
@@ -24,6 +26,7 @@ let hookServer = null;
 let sessionScanner = null;
 let policy = null;
 let fgWatcher = null;
+let remote = null;
 let shortcutConflicts = [];
 const OWN_PIDS = new Set([process.pid]);
 
@@ -102,13 +105,23 @@ app.whenReady().then(async () => {
   policy = new AttentionPolicy({ config, getIdleSeconds: () => powerMonitor.getSystemIdleTime() });
   policy.start();
   try {
-    powerMonitor.on('lock-screen', () => policy.setAway(true, 'lock'));
-    powerMonitor.on('unlock-screen', () => policy.setAway(false));
+    // Lock then sleep then wake must stay "away (lock)" until the screen is actually unlocked.
+    let screenLocked = false;
+    powerMonitor.on('lock-screen', () => { screenLocked = true; policy.setAway(true, 'lock'); });
+    powerMonitor.on('unlock-screen', () => { screenLocked = false; policy.setAway(false); });
     powerMonitor.on('suspend', () => policy.setAway(true, 'suspend'));
-    powerMonitor.on('resume', () => policy.setAway(false));
+    powerMonitor.on('resume', () => { if (screenLocked) policy.setAway(true, 'lock'); else policy.setAway(false); });
   } catch {}
   policy.on('seen', (sessionId) => sessionManager.markSeen(sessionId));
-  policy.on('change', (st) => sendToRenderer('focus-state', st));
+  let lastSuppress = null;
+  policy.on('change', (st) => {
+    sendToRenderer('focus-state', st);
+    // Quiet periods silence every sound, so their start and end are logged for "why no sound" questions.
+    if (st.suppress !== lastSuppress) {
+      lastSuppress = st.suppress;
+      debugLog('focus', `quiet=${st.suppress} away=${st.away}${st.awayReason ? '(' + st.awayReason + ')' : ''} dnd=${st.dnd} fullscreen=${st.fullscreen}`);
+    }
+  });
   policy.on('quiet-ended', ({ since }) => sendQuietSummary(since));
 
   fgWatcher = new ForegroundWatcher();
@@ -117,6 +130,20 @@ app.whenReady().then(async () => {
   });
   fgWatcher.start();
   sessionManager.setPresenceProbe((sid) => policy.presenceAt(sid, !!(fgWatcher && fgWatcher.current)));
+
+  // The DingTalk secret is kept DPAPI-encrypted via safeStorage; without it remote answering cannot be configured.
+  remote = new RemoteBridge({
+    sessionManager, policy, config,
+    secrets: {
+      available: () => { try { return safeStorage.isEncryptionAvailable(); } catch { return false; } },
+      encrypt: (s) => safeStorage.encryptString(s).toString('base64'),
+      decrypt: (b) => safeStorage.decryptString(Buffer.from(b, 'base64'))
+    },
+    createChannel: (opts) => new DingTalkStream({ ...opts, ua: `codepeek/${app.getVersion()}` }),
+    isMuted: (cwd) => isMutedProject(cwd)
+  });
+  remote.on('status', (st) => sendToRenderer('remote-status', st));
+  remote.start();
 
   sessionManager.on('state-changed', () => {
     const state = sessionManager.getState();
@@ -132,26 +159,31 @@ app.whenReady().then(async () => {
     if (looking) sessionManager.markSeen(payload.sessionId, payload.version);
     const rec = sessionManager.attention.get(payload.sessionId);
     const alertNext = !!(rec && rec.alertNext);
+    // An explicit "alert me next time" outranks the project mute.
+    if (!alertNext && isMutedProject(payload.cwd)) return;
+    // Every finished turn chimes (soundOnComplete); whether a card also pops up is the alert mode's call.
+    sessionManager.emit('sound', 'complete', { sessionId: payload.sessionId });
     if (!policy.shouldExpandCompletion({ turnMs: payload.turnMs, looking, alertNext })) return;
     // Consumed only once it is actually shown; a suppressed one stays armed for the next finish.
     if (alertNext) sessionManager.attention.consumeAlertNext(payload.sessionId);
-    const sound = alertNext || config.get('completionAlert') === 'always';
-    sendToRenderer('completion-notify', { ...payload, kind: 'completion', alertNext, sound });
+    // A card that is allowed to pop up also chimes (soundOnComplete still applies); quiet mode never gets here.
+    sendToRenderer('completion-notify', { ...payload, kind: 'completion', alertNext, sound: false });
   });
 
   sessionManager.on('attention', ({ sessionId, kind, reason }) => {
-    if (policy.isQuiet()) return;
     const rec = sessionManager.attention.get(sessionId) || {};
+    if (isMutedProject(rec.cwd)) return;
+    sessionManager.emit('sound', 'permission', { sessionId });
+    if (policy.isQuiet()) return;
     sendToRenderer('completion-notify', {
       kind, reason, sessionId,
       projectName: rec.name || '', gitBranch: rec.gitBranch || '', cwd: rec.cwd || '', agent: rec.agent || 'claude',
-      lastResponse: rec.text || '', timestamp: Date.now(), sound: true
+      lastResponse: rec.text || '', timestamp: Date.now(), sound: false
     });
   });
 
   // Forward sound events to the renderer
   sessionManager.on('sound', (type, meta) => {
-    if (!config.get('soundEnabled') || (policy && policy.isQuiet())) return;
     const keyMap = {
       sessionStart: 'soundOnSessionStart',
       toolUse: 'soundOnToolUse',
@@ -159,7 +191,12 @@ app.whenReady().then(async () => {
       question: 'soundOnQuestion',
       complete: 'soundOnComplete'
     };
-    if (!config.get(keyMap[type])) return;
+    const s = meta && meta.sessionId ? sessionManager.sessions.get(meta.sessionId) : null;
+    const skip = !config.get('soundEnabled') ? 'sound-off' : (policy && policy.isSilent()) ? 'dnd-or-fullscreen'
+      : !config.get(keyMap[type]) ? 'type-off' : (s && isMutedProject(s.cwd)) ? 'muted-project' : '';
+    // toolUse fires on every tool call; only the sounds a user listens for are logged.
+    if (type !== 'toolUse') debugLog('sound', `${type} ${skip ? 'skipped ' + skip : 'played'}`);
+    if (skip) return;
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('play-sound', type);
     }
@@ -170,7 +207,7 @@ app.whenReady().then(async () => {
   config.on('changed', (key, value) => {
     const keys = new Set(key ? [key] : Object.keys(value || {}));
     if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('config-changed', config.get());
+      mainWindow.webContents.send('config-changed', publicConfig());
       if (keys.has('soundPack')) {
         mainWindow.webContents.send('sounds-changed', getAllSounds(config.get('soundPack') || 'soft'));
       }
@@ -271,7 +308,7 @@ function createWindow() {
       ? evt.message
       : args[2];
     if (typeof message !== 'string') return;
-    const m = /^\[(completion|perm|ui)\] ([\s\S]*)$/.exec(message);
+    const m = /^\[(completion|perm|ui|sound)\] ([\s\S]*)$/.exec(message);
     if (m) debugLog('renderer:' + m[1], m[2]);
   });
 
@@ -299,7 +336,7 @@ function createWindow() {
     }
   });
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (url && !url.startsWith('file:')) {
+    if (url && /^https?:\/\//i.test(url)) {
       shell.openExternal(url).catch(() => {});
     }
     return { action: 'deny' };
@@ -505,7 +542,7 @@ function secureHandle(channel, handler) {
 
 function registerIPC() {
   secureHandle('get-state', () => sessionManager.getState());
-  secureHandle('get-config', () => config.get());
+  secureHandle('get-config', () => publicConfig());
   secureHandle('get-dict', () => getDict(config.get('language')));
   secureHandle('get-agents', () => getAllAgents());
   secureHandle('get-sounds', () => getAllSounds(config.get('soundPack') || 'soft'));
@@ -519,9 +556,12 @@ function registerIPC() {
   })));
 
   secureHandle('set-config', (_, patch) => {
-    if (!patch || typeof patch !== 'object') return config.get();
-    config.setMultiple(patch);
-    return config.get();
+    if (!patch || typeof patch !== 'object') return publicConfig();
+    // Remote credentials and the bound account change only through the remote-* handlers below.
+    const clean = {};
+    for (const [k, v] of Object.entries(patch)) if (!/^remote/.test(k)) clean[k] = v;
+    config.setMultiple(clean);
+    return publicConfig();
   });
 
   secureHandle('quit-app', () => { app.isQuitting = true; app.quit(); });
@@ -667,6 +707,46 @@ function registerIPC() {
     shortcutConflicts
   }));
 
+  secureHandle('remote-get', () => remote.status());
+
+  secureHandle('remote-save', (_, patch) => {
+    if (!patch || typeof patch !== 'object') return { ok: false, error: 'invalid' };
+    const idOk = (v) => typeof v === 'string' && /^[\w.-]{0,128}$/.test(v);
+    const next = {};
+    if ('enabled' in patch) next.remoteEnabled = !!patch.enabled;
+    if ('clientId' in patch) { if (!idOk(patch.clientId)) return { ok: false, error: 'clientId' }; next.remoteClientId = patch.clientId; }
+    if ('robotCode' in patch) { if (!idOk(patch.robotCode)) return { ok: false, error: 'robotCode' }; next.remoteRobotCode = patch.robotCode; }
+    if ('pushWhen' in patch) { if (!['away', 'always'].includes(patch.pushWhen)) return { ok: false, error: 'pushWhen' }; next.remotePushWhen = patch.pushWhen; }
+    if ('awaySeconds' in patch) next.remoteAwaySeconds = Math.min(3600, Math.max(30, parseInt(patch.awaySeconds) || 120));
+    if ('delaySeconds' in patch) next.remoteDelaySeconds = Math.min(3600, Math.max(0, parseInt(patch.delaySeconds) || 0));
+    if (typeof patch.clientSecret === 'string' && patch.clientSecret) {
+      if (patch.clientSecret.length > 256) return { ok: false, error: 'clientSecret' };
+      let enc;
+      try { enc = safeStorage.isEncryptionAvailable() ? safeStorage.encryptString(patch.clientSecret).toString('base64') : ''; } catch { enc = ''; }
+      if (!enc) return { ok: false, error: 'secure-storage' };
+      next.remoteSecretEnc = enc;
+    }
+    // A different robot or app means a different chat, so the old binding no longer applies.
+    if ((next.remoteClientId !== undefined && next.remoteClientId !== config.get('remoteClientId'))
+        || (next.remoteRobotCode !== undefined && next.remoteRobotCode !== config.get('remoteRobotCode'))) {
+      next.remoteStaffId = '';
+      next.remoteNick = '';
+      next.remoteCorpId = '';
+    }
+    const reconnect = ['remoteEnabled', 'remoteClientId', 'remoteRobotCode', 'remoteSecretEnc'].some(k => k in next);
+    config.setMultiple(next);
+    debugLog('remote', `settings saved keys=${Object.keys(next).filter(k => k !== 'remoteSecretEnc').join(',')}${next.remoteSecretEnc ? ',secret' : ''}`);
+    if (reconnect) remote.reload(); else remote.evaluate();
+    return { ok: true, status: remote.status() };
+  });
+
+  secureHandle('remote-pair', () => remote.startPairing());
+  secureHandle('remote-unbind', () => { remote.unbind(); return remote.status(); });
+  secureHandle('remote-test', async () => {
+    try { await remote.sendTest(); return { ok: true }; }
+    catch (err) { return { ok: false, error: err.message }; }
+  });
+
   secureHandle('repair-hooks', () => {
     try { hookInstaller.installHooks(); return { success: true, hooks: hookInstaller.getHookHealth() }; }
     catch (err) { return { success: false, error: err.message }; }
@@ -723,7 +803,7 @@ function registerIPC() {
       hookServerPort: hookServer ? hookServer.port : null
     };
     // Remove sensitive data
-    if (diag.config) delete diag.config.token;
+    if (diag.config) { delete diag.config.token; delete diag.config.remoteSecretEnc; delete diag.config.remoteStaffId; }
     return diag;
   });
 }
@@ -784,14 +864,28 @@ function registerShortcuts() {
   if (failed.length) debugLog('shortcut', `register failed: ${failed.join(', ')}`);
 }
 
+// The renderer never needs the encrypted DingTalk secret; remote settings come from remote-get.
+function publicConfig() {
+  const c = config.get();
+  delete c.remoteSecretEnc;
+  return c;
+}
+
 function sendToRenderer(channel, payload) {
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(channel, payload);
 }
 
 // After away / do-not-disturb ends, one card sums up what piled up instead of replaying every alert.
+// Muted projects still land in the inbox; they just never pop up or play a sound on their own.
+function isMutedProject(cwd) {
+  const k = String(cwd || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+  const list = config.get('mutedProjects');
+  return !!k && Array.isArray(list) && list.includes(k);
+}
+
 function sendQuietSummary(since) {
   const st = sessionManager.getState();
-  const att = st.attention || [];
+  const att = (st.attention || []).filter(a => !isMutedProject(a.cwd));
   const summary = {
     kind: 'summary',
     since,
@@ -803,7 +897,8 @@ function sendQuietSummary(since) {
   };
   if (summary.questions + summary.replies + summary.inputs + summary.blocked === 0) return;
   // New replies alone are not worth a sound; things waiting on the user are.
-  summary.sound = summary.questions + summary.inputs + summary.blocked > 0;
+  summary.sound = false;
+  if (summary.questions + summary.inputs + summary.blocked > 0) sessionManager.emit('sound', 'question', {});
   sendToRenderer('completion-notify', summary);
 }
 
@@ -811,6 +906,7 @@ app.on('before-quit', () => {
   app.isQuitting = true;
   try { globalShortcut.unregisterAll(); } catch {}
   if (fgWatcher) fgWatcher.stop();
+  if (remote) remote.stop();
   if (policy) policy.stop();
   if (sessionScanner) sessionScanner.stop();
   if (sessionManager) sessionManager.destroy();

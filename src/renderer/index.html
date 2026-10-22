@@ -99,6 +99,10 @@
                     <div class="rng"><input type="range" id="rangeShortTurn" min="5" max="120" step="5"><span class="v" id="valShortTurn"></span></div></div>
                   <div class="srow"><div class="lb"><span data-i18n="awayIdle">Away after</span><small data-i18n="awayIdleHint"></small></div>
                     <div class="rng"><input type="range" id="rangeAwayIdle" min="1" max="15" step="1"><span class="v" id="valAwayIdle"></span></div></div>
+                  <div class="srow"><div class="lb"><span data-i18n="followUp">Remind again</span><small data-i18n="followUpHint"></small></div>
+                    <div class="rng"><input type="range" id="rangeFollowUp" min="0" max="30" step="1"><span class="v" id="valFollowUp"></span></div></div>
+                  <div class="srow col"><div class="lb"><span data-i18n="mutedProjects">Muted projects</span><small data-i18n="mutedProjectsHint"></small></div>
+                    <div class="muted-list" id="mutedList"></div></div>
                   <div class="srow"><div class="lb" data-i18n="cleanupStale">Clean Stale Sessions After</div>
                     <div class="rng"><input type="number" id="numCleanup" min="0" max="86400" step="60"><span class="v" data-i18n="seconds">seconds</span></div></div>
                 </div>
@@ -199,6 +203,35 @@
                     <button class="btn line sm" id="btnHealthCheck" data-i18n="healthCheck">Check</button>
                     <button class="btn allow sm" id="btnHealthRepair" data-i18n="healthRepair" style="display:none">Repair</button></div></div>
                 </div>
+                <div class="sh" data-i18n="secRemote">Remote answering (DingTalk)</div>
+                <div class="sgrp" id="remoteGroup">
+                  <div class="srow"><div class="lb"><span data-i18n="remoteEnable">Push to DingTalk when away</span><small data-i18n="remoteEnableHint"></small></div>
+                    <label class="switch"><input type="checkbox" id="chkRemote"><span class="slider"></span></label></div>
+                  <div class="srow"><div class="lb"><span data-i18n="remoteState">Connection</span></div><span class="hstate" id="remoteState"></span></div>
+                  <div class="srow col remote-creds">
+                    <div class="lb"><span data-i18n="remoteCreds">Robot credentials</span><small data-i18n="remoteCredsHint"></small></div>
+                    <div class="remote-fields">
+                      <input type="text" id="txtRemoteClientId" autocomplete="off" spellcheck="false" placeholder="ClientID (AppKey)">
+                      <input type="password" id="txtRemoteSecret" autocomplete="off" placeholder="ClientSecret (AppSecret)">
+                      <input type="text" id="txtRemoteRobot" autocomplete="off" spellcheck="false" placeholder="RobotCode (optional)">
+                      <button class="btn line sm" id="btnRemoteSave" data-i18n="remoteSave">Save</button>
+                    </div></div>
+                  <div class="srow"><div class="lb"><span data-i18n="remoteBinding">Bound account</span><small id="remoteBindHint"></small></div>
+                    <div class="inline">
+                      <span class="hstate" id="remoteBound"></span>
+                      <button class="btn line sm" id="btnRemotePair" data-i18n="remotePair">Get pairing code</button>
+                      <button class="btn line sm" id="btnRemoteTest" data-i18n="remoteTest">Send test</button>
+                      <button class="btn line sm" id="btnRemoteUnbind" data-i18n="remoteUnbind">Unbind</button>
+                    </div></div>
+                  <div class="srow"><div class="lb"><span data-i18n="remotePushWhen">Push when</span><small id="remotePushHint"></small></div>
+                    <div class="mini-seg" id="segRemotePush">
+                      <span data-v="away" data-i18n="remotePushAway">Away</span><span data-v="always" data-i18n="remotePushAlways">Always</span>
+                    </div></div>
+                  <div class="srow" id="rowRemoteAway"><div class="lb"><span data-i18n="remoteAway">Away after</span><small data-i18n="remoteAwayHint"></small></div>
+                    <div class="rng"><input type="range" id="rangeRemoteAway" min="1" max="30" step="1"><span class="v" id="valRemoteAway"></span></div></div>
+                  <div class="srow" id="rowRemoteDelay"><div class="lb"><span data-i18n="remoteDelay">Wait before pushing</span><small data-i18n="remoteDelayHint"></small></div>
+                    <div class="rng"><input type="range" id="rangeRemoteDelay" min="0" max="600" step="30"><span class="v" id="valRemoteDelay"></span></div></div>
+                </div>
                 <div class="sh" data-i18n="enabledAgents">Enabled Agents</div>
                 <div class="sgrp" id="agentList"></div>
               </div>
@@ -210,8 +243,8 @@
   </div>
 
   <div class="toast" id="toast"></div>
-  <audio id="audio" preload="auto"></audio>
   <script src="mascots.js"></script>
+  <script src="markdown.js"></script>
   <script src="renderer.js"></script>
 </body>
 </html>

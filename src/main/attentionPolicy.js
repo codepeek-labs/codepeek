@@ -41,6 +41,8 @@ function matchForegroundSession(fg, sessions, procMap) {
   return { sessionId: s.id, confidence: confirmed ? 'confirmed' : 'likely' };
 }
 
+const TERMINAL_CLASSES = new Set(['CASCADIA_HOSTING_WINDOW_CLASS', 'ConsoleWindowClass', 'mintty', 'VirtualConsoleClass', 'PuTTY']);
+
 class AttentionPolicy extends EventEmitter {
   constructor({ config, getIdleSeconds } = {}) {
     super();
@@ -86,6 +88,9 @@ class AttentionPolicy extends EventEmitter {
 
   isQuiet() { return this.away || this.dndActive() || this.fullscreen; }
 
+  // Sounds stop only for an explicit DND or a fullscreen app; being away merely holds back pop-ups.
+  isSilent() { return this.dndActive() || this.fullscreen; }
+
   focusState() {
     return {
       away: this.away,
@@ -94,6 +99,7 @@ class AttentionPolicy extends EventEmitter {
       dndUntil: Number(this.cfg('dndUntil', 0)) || 0,
       fullscreen: this.fullscreen,
       suppress: this.isQuiet(),
+      silent: this.isSilent(),
       foregroundSessionId: this.foreground && this.foreground.confidence === 'confirmed' ? this.foreground.sessionId : null
     };
   }
@@ -126,9 +132,11 @@ class AttentionPolicy extends EventEmitter {
     const wasQuiet = this._quietNow();
     const own = !!(fg && ownPids && ownPids.has(fg.pid));
     this._ownForeground = own;
-    // Clicking the island itself must not count as leaving fullscreen or the watched terminal.
-    if (!own) this.fullscreen = !!(fg && fg.fullscreen);
     const match = own ? this.foreground : matchForegroundSession(fg, sessions, procMap);
+    // Clicking the island itself must not count as leaving fullscreen or the watched terminal.
+    // A fullscreen terminal is where the user works with the agents, so it never counts as a quiet period.
+    const atSession = !!(match && match.confidence === 'confirmed');
+    if (!own) this.fullscreen = !!(fg && fg.fullscreen && !atSession && !TERMINAL_CLASSES.has(fg.className));
     const prev = this.foreground;
     const same = prev && match && prev.sessionId === match.sessionId && prev.confidence === match.confidence;
     if (!same) {
@@ -146,9 +154,12 @@ class AttentionPolicy extends EventEmitter {
     if (!same || quietChanged) this._changed('foreground');
   }
 
+  idleSeconds() {
+    try { return Number(this._getIdle()) || 0; } catch { return 0; }
+  }
+
   pollIdle() {
-    let idle = 0;
-    try { idle = Number(this._getIdle()) || 0; } catch {}
+    const idle = this.idleSeconds();
     const limit = Math.max(30, Number(this.cfg('awayIdleSeconds', 120)) || 120);
     if (!this.away && idle >= limit) this.setAway(true, 'idle');
     else if (this.away && this.awayReason === 'idle' && idle < BACK_IDLE_S) this.setAway(false);
