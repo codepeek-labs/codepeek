@@ -9,14 +9,13 @@ const path = require('path');
 const os = require('os');
 const { spawn } = require('child_process');
 const config = require('./config');
+const codexOrigin = require('./codexOrigin');
 
 const CLAUDE_DIR = path.join(os.homedir(), '.claude');
 const SESSIONS_DIR = path.join(CLAUDE_DIR, 'sessions');
 const PROJECTS_DIR = path.join(CLAUDE_DIR, 'projects');
 
-// Codex CLI data directory (@openai/codex)
-const CODEX_DIR = path.join(os.homedir(), '.codex');
-const CODEX_SESSIONS_DIR = path.join(CODEX_DIR, 'sessions');
+const CODEX_SESSIONS_DIR = codexOrigin.SESSIONS_DIR;
 // Only surface codex sessions touched in the last 12h, up to N of them, to avoid flooding the UI with old history.
 const CODEX_RECENT_WINDOW_MS = 12 * 60 * 60 * 1000;
 const CODEX_MAX_SESSIONS = 10;
@@ -160,7 +159,7 @@ class SessionScanner {
     } catch {}
   }
 
-  // Scan ~/.codex/sessions/<Y>/<M>/<D>/rollout-*.jsonl, sort by mtime desc, take the top N.
+  // Scan ~/.codex/sessions/<Y>/<M>/<D>/rollout-*.jsonl, newest first, keeping the user's own top N.
   // A session is active iff codex.exe is running AND its jsonl mtime is within 5 minutes.
   _scanCodexSessions() {
     if (!fs.existsSync(CODEX_SESSIONS_DIR)) return [];
@@ -190,7 +189,6 @@ class SessionScanner {
     }
 
     files.sort((a, b) => b.mtime - a.mtime);
-    const top = files.slice(0, CODEX_MAX_SESSIONS);
 
     // Any codex.exe in the process table is treated as "at least one session may be active".
     let hasCodexProc = false;
@@ -199,17 +197,22 @@ class SessionScanner {
     }
 
     const sessions = [];
-    for (const f of top) {
-      const meta = this._readCodexSessionMeta(f.path);
+    let own = 0;
+    for (const f of files) {
+      if (own >= CODEX_MAX_SESSIONS) break;
+      const meta = codexOrigin.readSessionMeta(f.path);
       if (!meta || !meta.id) continue;
       const isFresh = (Date.now() - f.mtime) <= CODEX_ACTIVE_WINDOW_MS;
+      // Agent-run sessions would crowd the user's own out of the cap; only fresh ones are kept, for their names.
+      if (meta.helper && !isFresh) continue;
+      if (!meta.helper) own++;
       const isRunning = hasCodexProc && isFresh;
       const cwd = meta.cwd || '';
       const projectName = this._getProjectName(cwd);
       sessions.push({
         id: meta.id,
         pid: 0, // codex.exe has no reliable PID<->session mapping, so jump-to-tab is disabled for now.
-        name: meta.title || projectName || meta.id.substring(0, 8),
+        name: projectName || meta.id.substring(0, 8),
         cwd,
         projectName,
         startedAt: meta.startedAt || f.mtime,
@@ -221,52 +224,11 @@ class SessionScanner {
         lastPrompt: '',
         lastResponse: '',
         agent: 'codex',
+        helper: meta.helper,
         source: 'scanner-codex'
       });
     }
     return sessions;
-  }
-
-  _readCodexSessionMeta(jsonlPath) {
-    // The first line of codex session_meta includes the full system prompt (>15KB),
-    // so a fixed 8KB read would truncate the JSON. Read in chunks until the first newline;
-    // cap total bytes at 1MB so a malformed file cannot blow up memory.
-    try {
-      const fd = fs.openSync(jsonlPath, 'r');
-      try {
-        const CHUNK = 16384;
-        const MAX = 1024 * 1024;
-        const chunks = [];
-        let total = 0;
-        let nlOffset = -1;
-        const tmp = Buffer.alloc(CHUNK);
-        while (total < MAX) {
-          const n = fs.readSync(fd, tmp, 0, CHUNK, total);
-          if (n === 0) break;
-          chunks.push(Buffer.from(tmp.slice(0, n)));
-          for (let i = 0; i < n; i++) {
-            if (tmp[i] === 0x0a) { nlOffset = total + i; break; }
-          }
-          total += n;
-          if (nlOffset >= 0) break;
-        }
-        const all = Buffer.concat(chunks);
-        const firstLine = (nlOffset >= 0 ? all.slice(0, nlOffset) : all).toString('utf8').trim();
-        if (!firstLine) return null;
-        const obj = JSON.parse(firstLine);
-        if (obj.type !== 'session_meta' || !obj.payload) return null;
-        const p = obj.payload;
-        return {
-          id: p.id || '',
-          cwd: p.cwd || '',
-          startedAt: p.timestamp ? Date.parse(p.timestamp) : 0,
-          model: p.model || p.model_provider || '',
-          title: ''
-        };
-      } finally {
-        fs.closeSync(fd);
-      }
-    } catch { return null; }
   }
 
   // Walk ~/.claude/projects/<dir>/*.jsonl, sort by mtime desc, and take the top N that aren't already active.

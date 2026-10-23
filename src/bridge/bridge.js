@@ -73,13 +73,15 @@ process.stdin.on('end', () => {
   }
 
   // Inject bridge metadata
-  event.bridge_version = '1.2.0';
+  event.bridge_version = '1.3.0';
   event.bridge_request_id = crypto.randomUUID ? crypto.randomUUID() : String(Date.now());
   event.bridge_platform = 'windows';
   event.bridge_timestamp = new Date().toISOString();
   event.bridge_pid = process.pid;
   event.bridge_ppid = process.ppid; // PID of the CLI that spawned the bridge (Claude/Codex)
   event._source = SOURCE; // 'claude' | 'codex'
+  // A Codex started inside Claude Code (its codex plugin, `codex exec` in a Bash call) inherits Claude's environment.
+  if (SOURCE === 'codex' && process.env.CLAUDECODE === '1') event.bridge_spawned_by = 'claude';
 
   // Only Claude's PermissionRequest and Notification are blocking.
   // All 5 Codex events are non-blocking.

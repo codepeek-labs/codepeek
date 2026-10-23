@@ -502,8 +502,9 @@ function renderSurface(name) {
   else if (name === 'completion') renderCompletion();
 }
 
+// Agent-run sessions work for a session that is already counted, so they never add to the totals.
 function sessionCounts() {
-  const sessions = currentState.sessions;
+  const sessions = currentState.sessions.filter(s => !s.helper);
   const running = sessions.filter(s => s.isRunning !== false && ['thinking', 'tool_use', 'subagent', 'compacting'].includes(s.status)).length;
   return { total: sessions.length, running, pending: liveRequests().length };
 }
@@ -588,7 +589,7 @@ function renderIndicator() {
       pillTime.dataset.since = String(oldest.timestamp || Date.now());
     };
   } else {
-    const runningSessions = sessions.filter(s => s.isRunning !== false && ['thinking', 'tool_use', 'subagent', 'compacting'].includes(s.status));
+    const runningSessions = sessions.filter(s => !s.helper && s.isRunning !== false && ['thinking', 'tool_use', 'subagent', 'compacting'].includes(s.status));
     if (runningSessions.length) {
       const s = runningSessions[0];
       agent = s.agent || 'claude';
@@ -695,10 +696,17 @@ const GROUP_ORDER = ['answer', 'reply', 'running', 'idle', 'ended'];
 const GROUP_LABEL = { answer: 'inboxAnswerGroup', reply: 'inboxReplyGroup', running: 'grpRunning', idle: 'grpIdle', ended: 'grpEnded' };
 const GROUP_DOT = { answer: 'a', reply: 'b', running: 'g', idle: '', ended: '' };
 
+const WORKING = ['thinking', 'tool_use', 'subagent', 'compacting', 'background'];
+// An agent-run Codex session is listed only while it works, or when the user asked to hear about it.
+function hiddenHelper(s) {
+  return !!s.helper && !(s.isRunning !== false && WORKING.includes(s.status))
+    && !attentionOf(s.id) && !currentState.alertNext.includes(s.id);
+}
+
 // Inbox entries whose session already left the scan (e.g. after a restart) still get a card.
 function inboxSessions() {
-  const sessions = currentState.sessions.slice();
-  const ids = new Set(sessions.map(x => x.id));
+  const sessions = currentState.sessions.filter(s => !hiddenHelper(s));
+  const ids = new Set(currentState.sessions.map(x => x.id));
   for (const a of currentState.attention) {
     if (ids.has(a.sessionId)) continue;
     sessions.push({ id: a.sessionId, name: a.name, cwd: a.cwd, agent: a.agent, gitBranch: a.gitBranch,
@@ -890,7 +898,7 @@ function sessionCard(s, view, rec) {
   const open = openDetails.has(s.id);
   const fp = [view.cls, view.label, sessionName(s), s.gitBranch, s.lastPrompt, replyText, s.lastError, s.pid, s.isRunning,
     toolInfo ? `${toolInfo.cls}|${toolInfo.name}|${toolInfo.arg}|${toolInfo.linger}` : '', s.id === selectedSessionId,
-    currentConfig.mascotEnabled, rec ? `${rec.kind}:${rec.version}` : '', since, alertNext, open, isMutedCwd(s.cwd)].join('\u0001');
+    currentConfig.mascotEnabled, rec ? `${rec.kind}:${rec.version}` : '', since, alertNext, open, isMutedCwd(s.cwd), !!s.helper].join('\u0001');
   const r = c.refs;
   setTimeChip(r.time, s, since);
   setMascot(r.av, s.agent || 'claude', view.mascot, 36);
@@ -918,7 +926,7 @@ function sessionCard(s, view, rec) {
   } else {
     const a = currentAgents.find(x => x.id === (s.agent || 'claude'));
     r.term.appendChild(icon('E756'));
-    r.term.appendChild(document.createTextNode((a && a.name) || (s.agent || 'claude')));
+    r.term.appendChild(document.createTextNode(((a && a.name) || (s.agent || 'claude')) + (s.helper ? ' · ' + t('agentRun') : '')));
   }
   setText(r.prompt, s.lastPrompt);
   setText(r.reply, open ? '' : Markdown.plainText(replyText));

@@ -1,5 +1,10 @@
 'use strict';
 
+// Inherited from a Claude Code shell, these would reach every terminal CodePeek opens and make resumes look nested.
+for (const k of ['CLAUDECODE', 'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_CODE_CHILD_SESSION',
+  'CLAUDE_CODE_SESSION_ATTENDED', 'CLAUDE_CODE_EXECPATH', 'CLAUDE_CODE_MESSAGING_SOCKET', 'CLAUDE_CODE_MESSAGING_TOKEN',
+  'CLAUDE_PID', 'CLAUDE_PLUGIN_DATA', 'CLAUDE_PLUGIN_ROOT', 'CLAUDE_EFFORT']) delete process.env[k];
+
 const { app, BrowserWindow, ipcMain, screen, Tray, Menu, nativeImage, globalShortcut, shell, systemPreferences, powerMonitor, safeStorage } = require('electron');
 const path = require('path');
 const SessionManager = require('./sessionManager');
@@ -75,6 +80,10 @@ app.whenReady().then(async () => {
   } catch {}
 
   sessionManager = new SessionManager();
+  try {
+    const n = sessionManager.dropHelperRecords();
+    if (n) debugLog('inbox', `dropped ${n} agent-run codex replies`);
+  } catch {}
   hookServer = new HookServer(sessionManager);
 
   try {
@@ -192,7 +201,8 @@ app.whenReady().then(async () => {
     };
     const s = meta && meta.sessionId ? sessionManager.sessions.get(meta.sessionId) : null;
     const skip = !config.get('soundEnabled') ? 'sound-off' : (policy && policy.isSilent()) ? 'dnd-or-fullscreen'
-      : !config.get(keyMap[type]) ? 'type-off' : (s && isMutedProject(s.cwd) && !(meta && meta.force)) ? 'muted-project' : '';
+      : !config.get(keyMap[type]) ? 'type-off' : (s && isMutedProject(s.cwd) && !(meta && meta.force)) ? 'muted-project'
+      : (s && s.helper && !(meta && meta.force)) ? 'agent-run' : '';
     // toolUse fires on every tool call; only the sounds a user listens for are logged.
     if (type !== 'toolUse') debugLog('sound', `${type} ${skip ? 'skipped ' + skip : 'played'}`);
     if (skip) return;
@@ -395,7 +405,7 @@ function scheduleTrayUpdate(state) {
     const att = state.attention || [];
     const waiting = state.pendingPermissions.length + state.pendingQuestions.length + att.filter(a => a.kind !== 'reply').length;
     const replies = att.filter(a => a.kind === 'reply').length;
-    const running = state.sessions.filter(s => s.isRunning !== false && ['thinking', 'tool_use', 'subagent', 'compacting', 'background'].includes(s.status)).length;
+    const running = state.sessions.filter(s => !s.helper && s.isRunning !== false && ['thinking', 'tool_use', 'subagent', 'compacting', 'background'].includes(s.status)).length;
     const kind = waiting ? 'waiting' : replies ? 'reply' : running ? 'running' : 'idle';
     if (kind !== trayKind) { trayKind = kind; tray.setImage(trayIcon(kind)); }
     const parts = [];

@@ -7,6 +7,7 @@ const { detectAgentFromEvent } = require('./agents');
 const { normalizeEvent } = require('./eventNormalizer');
 const TranscriptWatcher = require('./transcriptWatcher');
 const AttentionStore = require('./attentionStore');
+const codexOrigin = require('./codexOrigin');
 const { debugLog } = require('./debugLog');
 
 // Stale-session cleanup timeout (configurable).
@@ -153,6 +154,8 @@ class SessionManager extends EventEmitter {
     this.attention = opts.attentionStore || new AttentionStore();
     // (sessionId) => true | false | null: is the user at that session's terminal right now (null = unknown).
     this._presenceProbe = opts.presenceProbe || (() => null);
+    // (sessionId, transcriptPath) => { helper } | null: who started a Codex session (null = rollout not readable yet).
+    this._codexMeta = opts.codexMeta || ((id, file) => codexOrigin.lookup(id, file));
     this._transcripts = opts.transcriptWatcher
       || new TranscriptWatcher((key, toolUseId, m) => this._onTranscriptResult(key, toolUseId, m));
     this._cleanupTimer = setInterval(() => this._cleanupStaleSessions(), 15000);
@@ -230,7 +233,28 @@ class SessionManager extends EventEmitter {
 
   updateScannedSessions(scanned) {
     this.scannedSessions = scanned;
+    for (const s of scanned) if (s.helper) this._dropHelperRecord(s.id);
     this.emit('state-changed');
+  }
+
+  // Clears inbox entries of agent-run Codex sessions, e.g. ones recorded before they could be told apart.
+  dropHelperRecords() {
+    let dropped = 0;
+    for (const r of this.attention.list()) {
+      if (r.agent !== 'codex' || r.alertNext) continue;
+      let meta = null;
+      try { meta = this._codexMeta(r.sessionId); } catch {}
+      if (meta && meta.helper && this._dropHelperRecord(r.sessionId)) dropped++;
+    }
+    if (dropped) this.emit('state-changed');
+    return dropped;
+  }
+
+  _dropHelperRecord(sessionId) {
+    const r = this.attention.get(sessionId);
+    if (!r || r.alertNext) return false;
+    this.attention.remove(sessionId);
+    return true;
   }
 
   // Returns { ok, status } where status is accepted | already-settled | invalid | delivery-failed.
@@ -557,8 +581,24 @@ class SessionManager extends EventEmitter {
     }
     session.lastActivity = Date.now();
     if (event.cwd) session.cwd = event.cwd;
+    if (session.agent === 'codex' && session.helper === undefined) this._classifyCodex(session, event);
     // bridge_ppid is the PID of the CLI process that spawned the bridge (Claude/Codex).
     if (event.bridge_ppid && !session.pid) session.pid = event.bridge_ppid;
+  }
+
+  // Ephemeral threads have no rollout, so the bridge's env mark wins; otherwise later events retry until one is on disk.
+  _classifyCodex(session, event) {
+    const byEnv = event.bridge_spawned_by === 'claude';
+    if (byEnv) {
+      session.helper = true;
+    } else {
+      let meta = null;
+      try { meta = this._codexMeta(session.id, event.transcript_path); } catch {}
+      if (!meta) return;
+      session.helper = !!meta.helper;
+    }
+    debugLog('codex', `sid=${session.id} helper=${session.helper} via=${byEnv ? 'env' : 'rollout'}`);
+    if (session.helper) this._dropHelperRecord(session.id);
   }
 
   _onSessionEnd(sessionId) {
@@ -754,13 +794,23 @@ class SessionManager extends EventEmitter {
     const scanned = (this.scannedSessions || []).find(s => s.id === sessionId) || {};
     const cwd = session.cwd || scanned.cwd || '';
     const reply = text !== undefined ? text : (session.lastResponse || '');
+    const detectedAgent = session.agent || scanned.agent;
+    const helper = detectedAgent !== 'codex' ? false
+      : session.helper !== undefined ? session.helper
+      : scanned.helper !== undefined ? !!scanned.helper : null;
+    const prev = this.attention.get(sessionId);
+    // An agent-run Codex reports back to the agent that started it; nobody is waiting on the user.
+    if (helper === true && !(prev && prev.alertNext)) {
+      debugLog('emit', `SKIP agent-run codex reply sid=${sessionId}`);
+      if (this._dropHelperRecord(sessionId)) this.emit('state-changed');
+      return;
+    }
     // Always recorded: the cwd heuristic below may only silence the alert, never drop an independent reply.
     const record = this.attention.reply(sessionId, this._metaOf(sessionId, session), reply);
     this.emit('state-changed');
 
-    // Codex in the same cwd as an active Claude session is usually Claude's /codex helper, so it stays quiet.
-    const detectedAgent = session.agent || scanned.agent;
-    if (detectedAgent === 'codex' && cwd && !record.alertNext) {
+    // Origin unknown: Codex in the same cwd as an active Claude session is usually Claude's helper, so it stays quiet.
+    if (helper === null && cwd && !record.alertNext) {
       const CLAUDE_ACTIVE_WINDOW_MS = 2 * 60 * 1000;
       for (const [, s] of this.sessions) {
         if (s.id !== sessionId && s.agent === 'claude' && s.cwd === cwd
